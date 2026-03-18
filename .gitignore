@@ -1,0 +1,28 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.env
+.env.*
+
+# VS Code
+.vscode/
+
+# Logs and temp
+*.log
+tmp/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+AA_Simulation/check_unused_functions.py
