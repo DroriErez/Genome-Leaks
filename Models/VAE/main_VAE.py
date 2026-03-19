@@ -15,8 +15,8 @@ from pca_plot_genomes import pca_plot
 from sklearn.decomposition import PCA
 from torch.nn import functional as F
 
-inpt = "1000G_real_genomes/10K_SNP_1000G_real_PADDED_train.hapt" #hdf format input file
-eval_inpt = "1000G_real_genomes/10K_SNP_1000G_real_PADDED_eval.hapt" #hdf format input file
+inpt = "Data/1000G_real_genomes/10K_SNP_1000G_real_PADDED_train.hapt" #hdf format input file
+eval_inpt = "Data/1000G_real_genomes/10K_SNP_1000G_real_PADDED_eval.hapt" #hdf format input file
 
 out_dir = "./output_dir"
 model_name = "VAE_model"
