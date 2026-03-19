@@ -49,6 +49,6 @@ if __name__ == "__main__":
 
     # Evaluate member disclosure for integer fractions (e.g., number of exposed samples).
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Evaluating member disclosure...")
-    fractions = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    evaluate_member_disclosure(N, S, n_trials=1000, fractions=fractions, show_plot=True)
+    fractions = [0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    evaluate_member_disclosure(N, S, n_trials=500, fractions=fractions, show_plot=True)
 

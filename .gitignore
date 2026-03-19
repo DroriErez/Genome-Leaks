@@ -26,3 +26,5 @@ tmp/
 # Jupyter
 .ipynb_checkpoints/
 AA_Simulation/check_unused_functions.py
+*.hapt
+*.legend
