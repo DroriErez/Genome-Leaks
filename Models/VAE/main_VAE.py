@@ -101,9 +101,15 @@ for epoch in range(start_epoch, epochs):
         torch.cuda.empty_cache()
 
         torch.save({
+        'epoch': epoch,
         'VAE': vae.state_dict(),
         'Encoder': vae.encoder.state_dict(),
-        'Decoder': vae.decoder.state_dict()},
+        'Decoder': vae.decoder.state_dict(),
+        'data_shape': df_noname.shape[1],
+        'latent_size': latent_size,
+        'channels': channels,
+        'noise_dim': noise_dim,
+        'alph': alph},
         f'{out_dir}/{model_name}_{epoch}')
 
         vae.eval()
@@ -165,7 +171,12 @@ for epoch in range(start_epoch, epochs):
         'epoch': epoch,
         'VAE': vae.state_dict(),
         'Encoder': vae.encoder.state_dict(),
-        'Decoder': vae.decoder.state_dict()},
+        'Decoder': vae.decoder.state_dict(),
+        'data_shape': df_noname.shape[1],
+        'latent_size': latent_size,
+        'channels': channels,
+        'noise_dim': noise_dim,
+        'alph': alph},
         f'{out_dir}/{model_name}_last_model')
 
 

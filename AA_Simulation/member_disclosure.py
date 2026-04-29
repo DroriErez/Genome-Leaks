@@ -22,6 +22,8 @@ def evaluate_member_disclosure(N, S, n_trials=1000, fractions=[0, 0.01, 0.02, 0.
     precisions = []
     recalls = []
     f1s = []
+    tprs = []
+    fprs = []
 
     p_coverage_Training_Set = 0.99
     f_coverage = int(np.log(S) + np.log(1 / (1 - p_coverage_Training_Set)))
@@ -54,22 +56,36 @@ def evaluate_member_disclosure(N, S, n_trials=1000, fractions=[0, 0.01, 0.02, 0.
                 correct += 1
         # Calculate metrics
         accuracy = correct / n_trials
-        accuracies.append(accuracy)
         precision = precision_score(y_true, y_pred, zero_division=0)
         recall = recall_score(y_true, y_pred, zero_division=0)
         f1 = f1_score(y_true, y_pred, zero_division=0)
+
+        tp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
+        tn = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
+        fp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
+        fn = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)
+
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+        accuracies.append(accuracy)
         precisions.append(precision)
         recalls.append(recall)
         f1s.append(f1)
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fraction: {frac:.2f}, Membership inference accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        tprs.append(tpr)
+        fprs.append(fpr)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fraction: {frac:.2f}, Membership inference accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, TPR: {tpr:.4f}, FPR: {fpr:.4f}")
 
     if show_plot:
         # Plotting the membership inference results
         plt.figure(figsize=(10, 6))
         plt.plot(fractions, accuracies, marker='o', label='Accuracy')
-        plt.plot(fractions, precisions, marker='s', label='Precision')
-        plt.plot(fractions, recalls, marker='^', label='Recall')
-        plt.plot(fractions, f1s, marker='d', label='F1 Score')
+        plt.plot(fractions, tprs, marker='s', label='True Positive Rate')
+        plt.plot(fractions, fprs, marker='^', label='False Positive Rate')
+
+        # plt.plot(fractions, precisions, marker='s', label='Precision')
+        # plt.plot(fractions, recalls, marker='^', label='Recall')
+        # plt.plot(fractions, f1s, marker='d', label='F1 Score')
         plt.xlabel('Fraction of Sequence Copied (n/N)')
         plt.ylabel('Metric Value')
         plt.title('Membership Inference Metrics vs. Copied Fraction')
