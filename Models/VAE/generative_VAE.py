@@ -27,16 +27,10 @@ import torch
 import numpy as np
 from models.VAE.models_10K_VAE import VAE
 
-try:
-    from Gen_Model_Wrapper import GenomeGenerativeModel
-except ImportError:
-    try:
-        from Models.Gen_Model_Wrapper import GenomeGenerativeModel
-    except ImportError:
-        GenomeGenerativeModel = object
+from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper
 
 
-class VAE_generative(GenomeGenerativeModel):
+class VAE_generative(GenomeGenerativeModelWrapper):
     """Variational Autoencoder wrapper.
 
     This class provides a minimal API:
@@ -49,7 +43,9 @@ class VAE_generative(GenomeGenerativeModel):
     """
 
     def __init__(self, model_path: str = None, device: torch.device = None):
+        super().__init__(model_path)  
         self.model = None
+        self.model_architecture = "VAE"
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
         if model_path:

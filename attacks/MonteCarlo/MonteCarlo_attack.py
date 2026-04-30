@@ -25,7 +25,6 @@ class MonteCarlo_attack(attack):
         self,
         n_samples: int = 1000,
         distance_metric: str = "euclidean",
-        threshold: Optional[float] = None,
     ) -> None:
         """
         Initialize Monte Carlo Attack.
@@ -33,9 +32,8 @@ class MonteCarlo_attack(attack):
         Args:
             n_samples: Number of Monte Carlo samples to draw
             distance_metric: Distance metric to use ('euclidean', 'cosine', etc.)
-            threshold: Decision threshold for membership (higher = member)
         """
-        super().__init__(threshold=threshold)
+        super().__init__()
         self.n_samples = n_samples
         self.distance_metric = distance_metric
         self.ref_distances = None
@@ -47,31 +45,37 @@ class MonteCarlo_attack(attack):
         self.synthetic_mean_distance = None
         self.synthetic_std_distance = None
 
-    def fit(self, train_data: np.ndarray, non_train_data: np.ndarray, synthetic_data: np.ndarray):
-        """Override fit to accept train_data, non_train_data, and synthetic_data."""
-        self._fit(train_data=train_data, non_train_data=non_train_data, synthetic_data=synthetic_data)
+    def fit(
+        self,
+        non_train_data: np.ndarray,
+        synthetic_data: np.ndarray,
+        thr: float = 0.5,
+        modelWrapper=None,
+    ) -> None:
+        """Fit the attack and store the decision threshold."""
+        self.modelWrapper = modelWrapper
+        self.threshold = thr
+        self.synthetic_data = synthetic_data
+        self._fit(non_train_data=non_train_data, synthetic_data=synthetic_data, modelWrapper=modelWrapper)
         self.is_fitted = True
         return
 
-    def _fit(self, train_data, non_train_data, synthetic_data):
+    def _fit(self, non_train_data, synthetic_data, modelWrapper=None):
         if len(synthetic_data) < 2:
             raise ValueError("Synthetic data must contain at least 2 samples")
 
-        distances_tr = []
         distances_non = []
-
-        for x in train_data:
-            d = dist.cdist([x], synthetic_data, metric=self.distance_metric)[0]
-            distances_tr.append(np.min(d))
 
         for x in non_train_data:
             d = dist.cdist([x], synthetic_data, metric=self.distance_metric)[0]
             distances_non.append(np.min(d))
 
-        distances = np.concatenate([distances_tr, distances_non])
-        self.d_min = np.median(distances)
+        self.d_min = np.median(distances_non)
         
     def score(self, candidates, synthetic_data=None, **kwargs):
+        if synthetic_data is None:
+            synthetic_data = getattr(self, "synthetic_data", None)
+
         if synthetic_data is None:
             raise ValueError("synthetic_data must be provided")
 

@@ -7,13 +7,17 @@ from sklearn.metrics import roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
 
 
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from attacks.random.random_attack import RandomAttack
 from attacks.MonteCarlo.MonteCarlo_attack import MonteCarlo_attack
+from attacks.SimpleRecostructionErrorAttack.simple_reconstruction_error_attack import SimpleReconstructionAttack
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper 
+from models.models_factory import create_model_wrapper
+from AA_Simulation.measurements import calc_AA
 
 
 # Define paths
@@ -59,6 +63,15 @@ def save_attack_predictions(model_name, attack_name, true_labels, predictions, s
         "score": scores
     }).to_csv(out_path, index=False)
     return out_path
+
+def call_AA_dist_metrics(training_points, test_points, synth_points):
+
+        AAtr, real2real_dists_tr, real2synth_dists_tr, synth2synth_dists_tr = calc_AA(training_points, synth_points)
+        AAte, real2real_dists_te, real2synth_dists_te, synth2synth_dists_te = calc_AA(test_points, synth_points)
+
+        privacy_loss = AAte - AAtr
+
+        return AAtr, AAte, privacy_loss
 
 
 # TPR at fixed FPR
@@ -130,10 +143,8 @@ def plot_roc_curve(y_true, scores, title="ROC Curve", show=True, save_path=None)
     if save_path is not None:
         plt.savefig(save_path, bbox_inches="tight")
 
-    if show:
-        plt.show()
-    else:
-        plt.close()
+    plt.show(block=show)
+    plt.close()
 
         
 def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100) -> dict:
@@ -154,6 +165,21 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
     """
     results = {}
     load_n = 100
+
+
+    """Run a set of attacks on a model wrapper.
+    This function is intended as the centralized attacker interface for the `attack_models.py` script.
+    Args:   
+        wrapper: instance of GenomeGenerativeModelWrapper.
+        train_path: path to training data file.
+        attack_train_path: path to attack training data file.
+        non_train_path: path to non-training data file.
+        test_path: path to test data file.
+    Returns:
+        dict: summary of attack metrics.
+    """
+
+    print(f"Running attacks on model: {model.model_name}, with number of samples: {load_n}")
 
     # Load a sample of test data in batches for efficiency
 
@@ -187,13 +213,21 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
     test_labels = y[perm]
 
     # Generate synthetic samples using the wrapper model
-    synthetic_as_train_samples = model.generate(n=load_n)
     synthetic_samples = model.generate(n=load_n)
 
     attacks = [
-        # RandomAttack(threshold=0.5),
-        MonteCarlo_attack(n_samples=1000, distance_metric="euclidean", threshold=0.01)
+        RandomAttack(),
+        MonteCarlo_attack(n_samples=1000, distance_metric="euclidean"),
+        SimpleReconstructionAttack()
     ]  # Attack instances
+
+    attack_thresholds = {
+        "monte_carlo_attack": 0.01,
+    }
+
+
+    AAtr,AAte, privacy_loss = call_AA_dist_metrics(train_samples, non_train_samples, synthetic_samples)
+    print(f"AA on model {model.model_name}: AAtr: {AAtr:.4f}, AAte: {AAte:.4f}, Privacy Loss: {privacy_loss:.4f}")   
 
     for attack_instance in attacks:
         if not attack_instance.is_attack_applicable(model):
@@ -202,22 +236,17 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
 
         attack_name = attack_instance.name
         print(f"Running attack: {attack_name}")
-        attack_instance.fit(train_data=synthetic_as_train_samples, non_train_data=non_train_samples, synthetic_data=synthetic_samples)  # Fit on synthetic and non-training samples
+        attack_instance.fit(
+            non_train_data=non_train_samples,
+            synthetic_data=synthetic_samples,
+            thr=attack_thresholds.get(attack_name, 0.5),
+            modelWrapper=model,
+        )  # Fit on synthetic and non-training samples
 
-        predictions, scores = attack_instance.predict(test_data, synthetic_data=synthetic_samples)
+        predictions, scores = attack_instance.predict(test_data)
 
-
-        scores_train = attack_instance.score(train_data, synthetic_data=synthetic_samples)
-        scores_non = attack_instance.score(non_train_data, synthetic_data=synthetic_samples)
-
-        print("train mean:", scores_train.mean())
-        print("non mean:", scores_non.mean())
-        print("train median:", np.median(scores_train))
-        print("non median:", np.median(scores_non))
-        print("train max:", scores_train.max())
-        print("non max:", scores_non.max())
-        print("threshold 99%", np.percentile(scores_non, 99))
-        print("threshold 99.9%", np.percentile(scores_non, 99.9))
+        print("threshold 99%", np.percentile(scores, 99))
+        print("threshold 99.9%", np.percentile(scores, 99.9))
 
 
         eval_metrics = evaluate_predictions(test_labels, predictions, scores)
@@ -260,8 +289,8 @@ for model_file in Path(models_folder).glob("*.pth"):
         print(f"\nProcessing model: {model_file.name}")
         
         # Build wrapper from model file
-        model = GenomeGenerativeModelWrapper(model_file.stem, str(model_file))
-        print(f"Using wrapper model type: {model.get_model_type()}")
+        model = create_model_wrapper(file_name=str(model_file))
+        print(f"Using wrapper model architecture: {model.get_model_architecture()}")
 
         # Generate dataset paths based on model file name
         base = model_file.stem

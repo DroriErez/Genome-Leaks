@@ -12,7 +12,7 @@ class RandomAttack(attack):
     Simulates random attack behavior with configurable options.
     """
     name = "random_attack"
-    def score(self, candidates: np.ndarray, **kwargs: Any) -> float:
+    def score(self, candidates: np.ndarray) -> float:
         """Simulate scoring by returning a random float between 0 and 1.
 
         Args:
