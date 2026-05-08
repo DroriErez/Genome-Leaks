@@ -216,13 +216,13 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
     synthetic_samples = model.generate(n=load_n)
 
     attacks = [
-        RandomAttack(),
-        MonteCarlo_attack(n_samples=1000, distance_metric="euclidean"),
-        SimpleReconstructionAttack()
+        # RandomAttack(),
+        MonteCarlo_attack(n_samples=10000, distance_metric="euclidean"),
+        # SimpleReconstructionAttack()
     ]  # Attack instances
 
     attack_thresholds = {
-        "monte_carlo_attack": 0.01,
+        "monte_carlo_attack": 0.1,
     }
 
 
@@ -244,6 +244,10 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
         )  # Fit on synthetic and non-training samples
 
         predictions, scores = attack_instance.predict(test_data)
+
+        print("test_label,predicted_label,score")
+        for test_label, predicted_label, score in zip(test_labels, predictions, scores):
+            print(f"{int(test_label)},{int(predicted_label)},{score:.6f}")
 
         print("threshold 99%", np.percentile(scores, 99))
         print("threshold 99.9%", np.percentile(scores, 99.9))
