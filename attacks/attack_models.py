@@ -14,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from attacks.random.random_attack import RandomAttack
 from attacks.MonteCarlo.MonteCarlo_attack import MonteCarlo_attack
-from attacks.SimpleRecostructionErrorAttack.simple_reconstruction_error_attack import SimpleReconstructionAttack
+from attacks.RecostructionAttack.reconstruction_attack import ReconstructionAttack
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper 
 from models.models_factory import create_model_wrapper
 from AA_Simulation.measurements import calc_AA
@@ -164,7 +164,8 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
         dict: summary of attack metrics.
     """
     results = {}
-    load_n = 100
+    load_n = 500
+    AA_n = 100
 
 
     """Run a set of attacks on a model wrapper.
@@ -213,20 +214,21 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
     test_labels = y[perm]
 
     # Generate synthetic samples using the wrapper model
-    synthetic_samples = model.generate(n=load_n)
+    synthetic_samples = model.generate(n=AA_n)
 
     attacks = [
         # RandomAttack(),
-        MonteCarlo_attack(n_samples=10000, distance_metric="euclidean"),
-        # SimpleReconstructionAttack()
+        MonteCarlo_attack(n_samples=100000, distance_metric="euclidean"),
+        # ReconstructionAttack()
     ]  # Attack instances
 
     attack_thresholds = {
-        "monte_carlo_attack": 0.1,
+        "monte_carlo_attack": 0.99,
+        "reconstruction_attack": 0.5,
     }
 
 
-    AAtr,AAte, privacy_loss = call_AA_dist_metrics(train_samples, non_train_samples, synthetic_samples)
+    AAtr,AAte, privacy_loss = call_AA_dist_metrics(train_samples[:AA_n], non_train_samples[:AA_n], synthetic_samples[:AA_n])
     print(f"AA on model {model.model_name}: AAtr: {AAtr:.4f}, AAte: {AAte:.4f}, Privacy Loss: {privacy_loss:.4f}")   
 
     for attack_instance in attacks:
@@ -238,19 +240,18 @@ def run_attacks(model, train_path, attack_train_path, non_train_path, load_n=100
         print(f"Running attack: {attack_name}")
         attack_instance.fit(
             non_train_data=non_train_samples,
-            synthetic_data=synthetic_samples,
             thr=attack_thresholds.get(attack_name, 0.5),
             modelWrapper=model,
         )  # Fit on synthetic and non-training samples
 
         predictions, scores = attack_instance.predict(test_data)
 
-        print("test_label,predicted_label,score")
-        for test_label, predicted_label, score in zip(test_labels, predictions, scores):
-            print(f"{int(test_label)},{int(predicted_label)},{score:.6f}")
+        # print("test_label,predicted_label,score")
+        # for test_label, predicted_label, score in zip(test_labels, predictions, scores):
+        #     print(f"{int(test_label)},{int(predicted_label)},{score:.6f}")
 
-        print("threshold 99%", np.percentile(scores, 99))
-        print("threshold 99.9%", np.percentile(scores, 99.9))
+        # print("threshold 99%", np.percentile(scores, 99))
+        # print("threshold 99.9%", np.percentile(scores, 99.9))
 
 
         eval_metrics = evaluate_predictions(test_labels, predictions, scores)
