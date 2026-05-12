@@ -9,4 +9,4 @@ for path in files:
     # df = pd.read_hdf(path, key="df1")
     n_dna = len(df)          # or df.shape[0]
 
-    print("Number of DNAs:", n_dna, "for file:", path)
+    print("Number of DNAs:", n_dna, "of ", df.shape[1],"SNPs", "for file:", path)
