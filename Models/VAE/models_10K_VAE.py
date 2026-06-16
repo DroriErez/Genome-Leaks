@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 
 
 class Block(nn.Module):
@@ -133,33 +132,33 @@ class Decoder(nn.Module):
     def forward(self, x):
 
         batch_size = x.shape[0]
-        x = torch.cat((self.ms_vars[0].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[0].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block1(x)
 
-        x = torch.cat((self.ms_vars[1].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[1].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block2(x)
 
         res = x
         x = self.block3(x)
         x += res
 
-        x = torch.cat((self.ms_vars[2].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[2].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block4(x)
 
-        x = torch.cat((self.ms_vars[3].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[3].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block5(x)
 
         res = x
         x = self.block6(x)
         x += res
 
-        x = torch.cat((self.ms_vars[4].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[4].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block7(x)
 
-        x = torch.cat((self.ms_vars[5].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[5].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block8(x)
 
-        x = torch.cat((self.ms_vars[6].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[6].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block9(x)
 
         return x
@@ -237,30 +236,30 @@ class Encoder(nn.Module):
 
     def forward(self, x):
         batch_size = x.shape[0]
-        x = torch.cat((self.ms_vars[0].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[0].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block1(x)
 
         res = x
         x = self.block2(x)
         x += res
 
-        x = torch.cat((self.ms_vars[1].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[1].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block3(x)
 
-        x = torch.cat((self.ms_vars[2].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[2].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block4(x)
 
         res = x
         x = self.block5(x)
         x += res
 
-        x = torch.cat((self.ms_vars[3].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[3].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block6(x)
 
-        x = torch.cat((self.ms_vars[4].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[4].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block7(x)
 
-        x = torch.cat((self.ms_vars[5].repeat(batch_size,1)[:,np.newaxis,:], x), 1)
+        x = torch.cat((self.ms_vars[5].expand(batch_size, -1).unsqueeze(1), x), 1)
         x = self.block8(x)
 
         mu =  self.block_last_mu(x)

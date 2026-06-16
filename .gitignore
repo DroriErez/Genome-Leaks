@@ -30,3 +30,12 @@ tmp/
 AA_Simulation/check_unused_functions.py
 *.hapt
 *.legend
+
+# results directory
+checkpoints/
+output/
+results/
+Plots/
+attacks/results/
+attacks/models_to_attack/*.pth
+models/saved_models/

@@ -1,9 +1,9 @@
 """
-Simple reconstruction-error membership inference attack.
+Simple reconstruction-loss membership inference attack.
 
 This attack is intended for autoencoder-style generative models, currently
 restricted to VAE wrappers by ``is_attack_applicable``. It reconstructs each
-candidate with the target model and uses the per-sample reconstruction error as
+candidate with the target model and uses the per-sample reconstruction loss as
 the privacy signal: samples that reconstruct unusually well are treated as more
 likely training members.
 
@@ -20,9 +20,9 @@ from torch.nn import functional as F
 
 from attack import attack
 
-class ReconstructionAttack(attack):
+class ReconstructionLossAttack(attack):
     """
-    Membership inference attack based on model reconstruction error.
+    Membership inference attack based on model reconstruction loss.
 
     The attack assumes that a generative model may reconstruct training samples
     better than non-training samples. During fitting, it stores reconstruction
@@ -42,7 +42,7 @@ class ReconstructionAttack(attack):
         non_train_losses: Reconstruction losses computed for non-training
             reference samples during fitting.
     """
-    name = "reconstruction_attack"
+    name = "reconstruction_loss_attack"
 
     def _as_2d(self, data):
         data = np.asarray(data)
@@ -109,7 +109,7 @@ class ReconstructionAttack(attack):
         model = modelWrapper.model if modelWrapper is not None else self.modelWrapper.model
         model.eval()
 
-        batch_eval_size = 128
+        batch_eval_size = 16
 
         self.non_train_losses = self._compute_reconstruction_losses(
             non_train_data,
@@ -123,7 +123,7 @@ class ReconstructionAttack(attack):
             self._threshold_to_percentile(self.threshold),
         )
         print(
-            "Fitted reconstruction error attack "
+            "Fitted reconstruction loss attack "
             f"with FPR target: {self.fpr_target:.4f}, "
             f"score threshold: {self.score_threshold:.4f}"
         )
@@ -236,14 +236,14 @@ class ReconstructionAttack(attack):
 
         Returns:
             One score per candidate. Scores are in ``[0, 1]``; higher scores
-            mean the candidate had lower reconstruction error relative to the
+            mean the candidate had lower reconstruction loss relative to the
             non-training reference distribution.
 
         Raises:
             ValueError: If no model wrapper was provided during fitting.
         """
         if self.modelWrapper is None:
-            raise ValueError("Model must be provided for reconstruction error attack")
+            raise ValueError("Model must be provided for reconstruction loss attack")
 
         if not hasattr(self, "non_train_losses"):
             raise ValueError("Attack must be fitted before scoring")

@@ -59,7 +59,7 @@ vae.to(device)
 
 
 # Load model if checkpoint exists
-checkpoint_path = f'{out_dir}/{model_name}_last_model'
+checkpoint_path = f'{out_dir}/{model_name}_last_model.pth'
 if os.path.exists(checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     vae.load_state_dict(checkpoint['VAE'])
@@ -110,7 +110,7 @@ for epoch in range(start_epoch, epochs):
         'channels': channels,
         'noise_dim': noise_dim,
         'alph': alph},
-        f'{out_dir}/{model_name}_{epoch}')
+        f'{out_dir}/{model_name}_{epoch}.pth')
 
         vae.eval()
         latent_samples = torch.normal(mean=0, std=1, size=(ag_size, 1, latent_size), device = device)
@@ -177,7 +177,7 @@ for epoch in range(start_epoch, epochs):
         'channels': channels,
         'noise_dim': noise_dim,
         'alph': alph},
-        f'{out_dir}/{model_name}_last_model')
+        f'{out_dir}/{model_name}_last_model.pth')
 
 
         vae.train()

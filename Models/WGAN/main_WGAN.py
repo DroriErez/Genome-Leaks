@@ -36,7 +36,7 @@ alph = 0.01 #alpha value for LeakyReLU
 g_learn = 0.0005 #generator learning rate
 d_learn = 0.0005 #discriminator learning rate
 epochs = 10001
-batch_size = 8 #96
+batch_size = 96
 channels = 10 #channel multiplier which dictates the number of channels for all layers
 ag_size = 500 #number of artificial genomes (haplotypes) to be created
 gpu = 1 #number of GPUs
@@ -147,7 +147,7 @@ def noise_generator(size, noise_count, noise_dim, device):
         noise_list.append(noise)
     return noise_list
 
-checkpoint_path = f'{out_dir}/{model_name}_last_model'
+checkpoint_path = f'{out_dir}/{model_name}_last_model.pth'
 if os.path.exists(checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     netG.load_state_dict(checkpoint['Generator'])
@@ -302,7 +302,7 @@ for epoch in range(start_epoch, epochs):
         'Critic': netC.state_dict(),
         'G_optimizer': g_optimizer.state_dict(),
         'C_optimizer': c_optimizer.state_dict()},
-        f'{out_dir}/{model_name}_{epoch}')
+        f'{out_dir}/{model_name}_{epoch}.pth')
 
         netG.eval()
         latent_samples = torch.normal(mean=0, std=1, size=(ag_size, noise_dim, latent_size), device=device) #create the initial noise to be fed to generator
@@ -340,7 +340,7 @@ for epoch in range(start_epoch, epochs):
         plt.close(fig)
 
         #Plot PCA
-        pca_plot(df, generated_genomes_df, epoch, dir=out_dir)
+        pca_plot(df, generated_genomes_df, epoch, dir=out_dir, model_name=model_name)
 
         # Evaluate critic difference in batches to minimize memory usage
         eval_critic_difference = 0.0
@@ -403,7 +403,7 @@ for epoch in range(start_epoch, epochs):
         'Critic': netC.state_dict(),
         'G_optimizer': g_optimizer.state_dict(),
         'C_optimizer': c_optimizer.state_dict()},
-        f'{out_dir}/{model_name}_last_model')
+        f'{out_dir}/{model_name}_last_model.pth')
 
         netG.train()
         netC.train()

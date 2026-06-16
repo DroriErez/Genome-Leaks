@@ -14,6 +14,7 @@ class GenomeGenerativeModelWrapper:
     This wrapper inspects the model filename prefix and instantiates the
     corresponding generator adapter. Supported prefixes:
       - VAE: `VAE_generative` in `Models/VAE/generative_VAE.py`
+      - WGAN: `WGAN_generative` in `Models/WGAN/generative_WGAN.py`
 
     Example:
         wrapper = GenomeGenerativeModelWrapper('output_dir/VAE_model_last_model')

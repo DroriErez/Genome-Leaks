@@ -1,4 +1,3 @@
-import torch
 """Genome VAE generator adapter.
 
 This module wraps `models_10K_VAE.VAE` with helper methods that load checkpoints
@@ -23,8 +22,14 @@ Usage:
     samples = g.generate(100)
 """
 
+import gc
+import sys
 import torch
 import numpy as np
+
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 from models.VAE.models_10K_VAE import VAE
 
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper
@@ -42,11 +47,17 @@ class VAE_generative(GenomeGenerativeModelWrapper):
         device: torch.device for computation
     """
 
-    def __init__(self, model_path: str = None, device: torch.device = None):
+    def __init__(
+        self,
+        model_path: str = None,
+        device: torch.device = None,
+        generation_batch_size: int = 1024,
+    ):
         super().__init__(model_path)  
         self.model = None
         self.model_architecture = "VAE"
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.generation_batch_size = generation_batch_size
 
         if model_path:
             self.init(model_path)
@@ -95,6 +106,31 @@ class VAE_generative(GenomeGenerativeModelWrapper):
         self.model = self.model.to(self.device)
         self.model.eval()
 
+    def _generate_batch(self, n: int, latent_size: int) -> np.ndarray:
+        latent_samples = torch.normal(
+            mean=0,
+            std=1,
+            size=(n, 1, latent_size),
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            generated_genomes = self.model.decoder(latent_samples)
+            generated_genomes = generated_genomes.detach().cpu().numpy()
+
+        generated_genomes[generated_genomes < 0] = 0
+        generated_genomes = np.rint(generated_genomes)
+        generated_genomes = generated_genomes.reshape(
+            generated_genomes.shape[0],
+            generated_genomes.shape[2],
+        )
+
+        del latent_samples
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return generated_genomes.astype(np.int8, copy=False)
+
     def generate(self, n: int) -> np.ndarray:
         """Generate n samples from the VAE.
 
@@ -116,18 +152,32 @@ class VAE_generative(GenomeGenerativeModelWrapper):
         """
         if self.model is None:
             raise ValueError("Model not loaded. Call init() first.")
+        if n < 1:
+            raise ValueError("n must be at least 1")
 
         latent_size = getattr(self.model.encoder, 'latent_size', None)
         if latent_size is None:
             raise AttributeError('Loaded model encoder contains no latent_size attribute')
 
         self.model.eval()
-        latent_samples = torch.normal(mean=0, std=1, size=(n, 1, latent_size), device = self.device)
-        with torch.no_grad():
-            generated_genomes = self.model.decoder(latent_samples)
-            generated_genomes = generated_genomes.detach().cpu().numpy()
-            generated_genomes[generated_genomes < 0] = 0
-            generated_genomes = np.rint(generated_genomes)
-            generated_genomes = generated_genomes.reshape(generated_genomes.shape[0],generated_genomes.shape[2])
+        first_batch_size = min(self.generation_batch_size, n)
+        first_batch = self._generate_batch(first_batch_size, latent_size)
+        generated_genomes = np.empty((n, first_batch.shape[1]), dtype=first_batch.dtype)
+        generated_genomes[:first_batch_size] = first_batch
+
+        generated_so_far = first_batch_size
+        del first_batch
+
+        while generated_so_far < n:
+            current_batch_size = min(
+                self.generation_batch_size,
+                n - generated_so_far,
+            )
+            batch = self._generate_batch(current_batch_size, latent_size)
+            end = generated_so_far + current_batch_size
+            generated_genomes[generated_so_far:end] = batch
+            generated_so_far = end
+            del batch
+            gc.collect()
 
         return generated_genomes
