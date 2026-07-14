@@ -21,6 +21,7 @@ import numpy as np
 
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper
 from models.WGAN.models_10K import ConvDiscriminator, ConvGenerator
+from utils.device import get_device
 
 
 class WGAN_generative(GenomeGenerativeModelWrapper):
@@ -36,7 +37,7 @@ class WGAN_generative(GenomeGenerativeModelWrapper):
         self.model = None
         self.critic = None
         self.model_architecture = "WGAN"
-        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = device or get_device()
         self.generation_batch_size = generation_batch_size
         self.data_shape = None
         self.latent_size = None
@@ -134,14 +135,14 @@ class WGAN_generative(GenomeGenerativeModelWrapper):
         try:
             return torch.load(
                 file_path,
-                weights_only=True,
+                weights_only=False,
                 map_location=self.device,
                 mmap=True,
             )
         except TypeError:
             return torch.load(
                 file_path,
-                weights_only=True,
+                weights_only=False,
                 map_location=self.device,
             )
 

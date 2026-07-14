@@ -9,9 +9,15 @@ membership scores against known non-training samples.
 from typing import Any, Optional, Tuple
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from attack import attack
@@ -42,6 +48,9 @@ class CriticScoreAttack(attack):
         self.non_train_raw_scores = None
         self.non_member_scores = None
         self.last_raw_scores = None
+
+    def get_display_name(self) -> str:
+        return "Critic Score Attack"
 
     def fit(
         self,
@@ -233,6 +242,146 @@ class CriticScoreAttack(attack):
         raw_scores = self._compute_raw_critic_scores(candidates, pack_mode=pack_mode)
         self.last_raw_scores = raw_scores
         return self._raw_scores_to_membership_scores(raw_scores)
+
+    def raw_score(
+        self,
+        candidates: np.ndarray,
+        pack_mode: Optional[str] = None,
+    ) -> np.ndarray:
+        """Return averaged raw critic scores before percentile calibration."""
+        if not hasattr(self, "non_train_raw_scores") or self.non_train_raw_scores is None:
+            raise ValueError("Attack must be fitted before scoring")
+
+        return self._compute_raw_critic_scores(candidates, pack_mode=pack_mode)
+
+    def raw_score_diagnostic(
+        self,
+        train_data: np.ndarray,
+        non_train_data: np.ndarray,
+        synthetic_data: np.ndarray,
+        model_name: Optional[str] = None,
+        output_dir: Optional[str] = None,
+    ) -> dict:
+        """Summarize raw critic scores for train, non-train, and synthetic samples."""
+        train_raw_scores = self.raw_score(train_data)
+        non_train_raw_scores = self.raw_score(non_train_data)
+        synthetic_raw_scores = self.raw_score(synthetic_data)
+
+        summary = {
+            "model": model_name,
+            "pack_mode": self.pack_mode,
+            "n_train": len(train_raw_scores),
+            "n_non_train": len(non_train_raw_scores),
+            "n_synthetic": len(synthetic_raw_scores),
+            "train_mean": np.mean(train_raw_scores),
+            "train_median": np.median(train_raw_scores),
+            "train_std": np.std(train_raw_scores),
+            "train_min": np.min(train_raw_scores),
+            "train_max": np.max(train_raw_scores),
+            "non_train_mean": np.mean(non_train_raw_scores),
+            "non_train_median": np.median(non_train_raw_scores),
+            "non_train_std": np.std(non_train_raw_scores),
+            "non_train_min": np.min(non_train_raw_scores),
+            "non_train_max": np.max(non_train_raw_scores),
+            "synthetic_mean": np.mean(synthetic_raw_scores),
+            "synthetic_median": np.median(synthetic_raw_scores),
+            "synthetic_std": np.std(synthetic_raw_scores),
+            "synthetic_min": np.min(synthetic_raw_scores),
+            "synthetic_max": np.max(synthetic_raw_scores),
+        }
+
+        if output_dir is not None:
+            if model_name is None:
+                raise ValueError("model_name must be provided when output_dir is set")
+            out_path = Path(output_dir) / f"{model_name}_{self.name}_diagnostic.csv"
+            diagnostic_rows = []
+            for split_name, split_scores in (
+                ("train", train_raw_scores),
+                ("non_train", non_train_raw_scores),
+                ("synthetic", synthetic_raw_scores),
+            ):
+                for sample_index, raw_score in enumerate(split_scores):
+                    diagnostic_rows.append({
+                        "model": model_name,
+                        "pack_mode": self.pack_mode,
+                        "split": split_name,
+                        "sample_index": sample_index,
+                        "average_raw_score": raw_score,
+                    })
+            pd.DataFrame(diagnostic_rows).to_csv(out_path, index=False)
+            summary["path"] = out_path
+
+            plot_path = Path(output_dir) / f"{model_name}_{self.name}_diagnostic_distribution.png"
+            self._plot_raw_score_distributions(
+                train_raw_scores,
+                non_train_raw_scores,
+                synthetic_raw_scores,
+                plot_path,
+            )
+            summary["plot_path"] = plot_path
+
+        return summary
+
+    def _plot_raw_score_distributions(
+        self,
+        train_raw_scores: np.ndarray,
+        non_train_raw_scores: np.ndarray,
+        synthetic_raw_scores: np.ndarray,
+        output_path: Path,
+    ) -> None:
+        """Save overlaid density lines for raw critic score distributions."""
+        all_scores = np.concatenate([
+            train_raw_scores,
+            non_train_raw_scores,
+            synthetic_raw_scores,
+        ])
+        if len(np.unique(all_scores)) < 2:
+            bins = 1
+        else:
+            bins = np.linspace(np.min(all_scores), np.max(all_scores), 101)
+
+        plt.figure(figsize=(8, 5))
+        for label, scores, color in (
+            ("Train", train_raw_scores, "tab:blue"),
+            ("Non-train", non_train_raw_scores, "tab:orange"),
+            ("Synthetic", synthetic_raw_scores, "tab:green"),
+        ):
+            density, edges = np.histogram(scores, bins=bins, density=True)
+            centers = (edges[:-1] + edges[1:]) / 2
+            smoothed_density = self._smooth_density(density)
+            plt.plot(
+                centers,
+                density,
+                color=color,
+                linestyle=":",
+                linewidth=1.2,
+                alpha=0.65,
+            )
+            plt.plot(
+                centers,
+                smoothed_density,
+                label=f"{label} smoothed",
+                color=color,
+                linewidth=2.2,
+            )
+
+        plt.xlabel("Average Raw Critic Score")
+        plt.ylabel("Density")
+        plt.title(f"{self.get_display_name()} Distributions ({self.pack_mode})")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(output_path, bbox_inches="tight")
+        plt.close()
+
+    @staticmethod
+    def _smooth_density(density: np.ndarray) -> np.ndarray:
+        if len(density) < 5:
+            return density
+
+        kernel = np.array([1, 4, 7, 10, 7, 4, 1], dtype=np.float64)
+        kernel = kernel / np.sum(kernel)
+        padded_density = np.pad(density, (len(kernel) // 2,), mode="edge")
+        return np.convolve(padded_density, kernel, mode="valid")
 
     def predict(
         self,

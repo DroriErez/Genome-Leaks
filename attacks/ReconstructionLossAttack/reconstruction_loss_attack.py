@@ -14,11 +14,18 @@ fraction of non-training reference losses that are greater than or equal to it.
 """
 
 import numpy as np
+import pandas as pd
 import torch
 from typing import Any, Optional, Tuple
+from pathlib import Path
 from torch.nn import functional as F
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from attack import attack
+from utils.device import get_memory_based_batch_size
 
 class ReconstructionLossAttack(attack):
     """
@@ -43,6 +50,9 @@ class ReconstructionLossAttack(attack):
             reference samples during fitting.
     """
     name = "reconstruction_loss_attack"
+
+    def get_display_name(self) -> str:
+        return "Reconstruction Loss Attack"
 
     def _as_2d(self, data):
         data = np.asarray(data)
@@ -109,11 +119,16 @@ class ReconstructionLossAttack(attack):
         model = modelWrapper.model if modelWrapper is not None else self.modelWrapper.model
         model.eval()
 
-        batch_eval_size = 16
+        self.batch_eval_size = get_memory_based_batch_size(
+            small_batch_size=16,
+            large_batch_size=256,
+            large_gpu_memory_gb=16,
+        )
+        print(f"Using reconstruction loss batch size: {self.batch_eval_size}")
 
         self.non_train_losses = self._compute_reconstruction_losses(
             non_train_data,
-            batch_size=batch_eval_size,
+            batch_size=self.batch_eval_size,
         )
 
         self.non_member_scores = self._losses_to_scores(self.non_train_losses)
@@ -248,8 +263,149 @@ class ReconstructionLossAttack(attack):
         if not hasattr(self, "non_train_losses"):
             raise ValueError("Attack must be fitted before scoring")
 
-        query_losses = self._compute_reconstruction_losses(candidates)
+        query_losses = self._compute_reconstruction_losses(
+            candidates,
+            batch_size=getattr(self, "batch_eval_size", 128),
+        )
         return self._losses_to_scores(query_losses)
+
+    def reconstruction_loss_diagnostic(
+        self,
+        train_data: np.ndarray,
+        non_train_data: np.ndarray,
+        synthetic_data: np.ndarray,
+        model_name: Optional[str] = None,
+        output_dir: Optional[str] = None,
+    ) -> dict:
+        """Summarize and save per-sample reconstruction losses for key splits."""
+        batch_size = getattr(self, "batch_eval_size", 128)
+        train_losses = self._compute_reconstruction_losses(
+            train_data,
+            batch_size=batch_size,
+        )
+        non_train_losses = self._compute_reconstruction_losses(
+            non_train_data,
+            batch_size=batch_size,
+        )
+        synthetic_losses = self._compute_reconstruction_losses(
+            synthetic_data,
+            batch_size=batch_size,
+        )
+
+        summary = {
+            "model": model_name,
+            "n_train": len(train_losses),
+            "n_non_train": len(non_train_losses),
+            "n_synthetic": len(synthetic_losses),
+            "train_mean": np.mean(train_losses),
+            "train_median": np.median(train_losses),
+            "train_std": np.std(train_losses),
+            "train_min": np.min(train_losses),
+            "train_max": np.max(train_losses),
+            "non_train_mean": np.mean(non_train_losses),
+            "non_train_median": np.median(non_train_losses),
+            "non_train_std": np.std(non_train_losses),
+            "non_train_min": np.min(non_train_losses),
+            "non_train_max": np.max(non_train_losses),
+            "synthetic_mean": np.mean(synthetic_losses),
+            "synthetic_median": np.median(synthetic_losses),
+            "synthetic_std": np.std(synthetic_losses),
+            "synthetic_min": np.min(synthetic_losses),
+            "synthetic_max": np.max(synthetic_losses),
+        }
+
+        if output_dir is not None:
+            if model_name is None:
+                raise ValueError("model_name must be provided when output_dir is set")
+
+            out_path = Path(output_dir) / f"{model_name}_{self.name}_diagnostic.csv"
+            diagnostic_rows = []
+            for split_name, split_losses in (
+                ("train", train_losses),
+                ("non_train", non_train_losses),
+                ("synthetic", synthetic_losses),
+            ):
+                for sample_index, loss in enumerate(split_losses):
+                    diagnostic_rows.append({
+                        "model": model_name,
+                        "split": split_name,
+                        "sample_index": sample_index,
+                        "average_reconstruction_loss": loss,
+                    })
+            pd.DataFrame(diagnostic_rows).to_csv(out_path, index=False)
+            summary["path"] = out_path
+
+            plot_path = Path(output_dir) / f"{model_name}_{self.name}_diagnostic_distribution.png"
+            self._plot_reconstruction_loss_distributions(
+                train_losses,
+                non_train_losses,
+                synthetic_losses,
+                plot_path,
+            )
+            summary["plot_path"] = plot_path
+
+        return summary
+
+    def _plot_reconstruction_loss_distributions(
+        self,
+        train_losses: np.ndarray,
+        non_train_losses: np.ndarray,
+        synthetic_losses: np.ndarray,
+        output_path: Path,
+    ) -> None:
+        """Save overlaid density lines for reconstruction-loss distributions."""
+        all_losses = np.concatenate([
+            train_losses,
+            non_train_losses,
+            synthetic_losses,
+        ])
+        if len(np.unique(all_losses)) < 2:
+            bins = 1
+        else:
+            bins = np.linspace(np.min(all_losses), np.max(all_losses), 101)
+
+        plt.figure(figsize=(8, 5))
+        for label, losses, color in (
+            ("Train", train_losses, "tab:blue"),
+            ("Non-train", non_train_losses, "tab:orange"),
+            ("Synthetic", synthetic_losses, "tab:green"),
+        ):
+            density, edges = np.histogram(losses, bins=bins, density=True)
+            centers = (edges[:-1] + edges[1:]) / 2
+            smoothed_density = self._smooth_density(density)
+            plt.plot(
+                centers,
+                density,
+                color=color,
+                linestyle=":",
+                linewidth=1.2,
+                alpha=0.65,
+            )
+            plt.plot(
+                centers,
+                smoothed_density,
+                label=f"{label} smoothed",
+                color=color,
+                linewidth=2.2,
+            )
+
+        plt.xlabel("Average Reconstruction Loss")
+        plt.ylabel("Density")
+        plt.title(f"{self.get_display_name()} Distributions")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.savefig(output_path, bbox_inches="tight")
+        plt.close()
+
+    @staticmethod
+    def _smooth_density(density: np.ndarray) -> np.ndarray:
+        if len(density) < 5:
+            return density
+
+        kernel = np.array([1, 4, 7, 10, 7, 4, 1], dtype=np.float64)
+        kernel = kernel / np.sum(kernel)
+        padded_density = np.pad(density, (len(kernel) // 2,), mode="edge")
+        return np.convolve(padded_density, kernel, mode="valid")
 
     def predict(
         self,

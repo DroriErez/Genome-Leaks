@@ -25,6 +25,11 @@ venv/
 tmp/
 *.tmp
 
+# Model files
+*.pth
+*.index
+*.data*
+
 # Jupyter
 .ipynb_checkpoints/
 AA_Simulation/check_unused_functions.py
@@ -36,6 +41,13 @@ checkpoints/
 output/
 results/
 Plots/
-attacks/results/
-attacks/models_to_attack/*.pth
-models/saved_models/
+*.csv
+*.xls
+
+models/AC_GAN/analysis/analysis_classifier_with_augmentations.ipynb
+models/AC_GAN/analysis/compare_models_analysis.py.ipynb
+models/AC_GAN/analysis/classifier_analysis.ipynb
+models/AC_GAN/analysis/data_analysis.ipynb
+.gitignore
+.gitignore
+models/AC_GAN/analysis/train_classifier_with_synthetic.ipynb

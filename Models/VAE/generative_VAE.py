@@ -33,6 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from models.VAE.models_10K_VAE import VAE
 
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper
+from utils.device import get_device
 
 
 class VAE_generative(GenomeGenerativeModelWrapper):
@@ -56,7 +57,7 @@ class VAE_generative(GenomeGenerativeModelWrapper):
         super().__init__(model_path)  
         self.model = None
         self.model_architecture = "VAE"
-        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = device or get_device()
         self.generation_batch_size = generation_batch_size
 
         if model_path:

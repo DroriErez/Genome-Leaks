@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -11,6 +12,31 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+PLOT_LABEL_FONT_SIZE = 22
+PLOT_TITLE_FONT_SIZE = 20
+PLOT_LEGEND_FONT_SIZE = 20
+PLOT_TICK_FONT_SIZE = 18
+PLOT_CALLOUT_FONT_SIZE = 20
+PLOT_FIG_SIZE = (6.5, 5.7)
+RUN_SUMMARY_COLUMNS = [
+    "Model name",
+    "Model type",
+    "Attack type",
+    "Attack",
+    "Accuracy @FPR=0.01",
+    "Accuracy @0.5",
+    "AUC",
+    "TPR@FPR=0.01",
+    "TPR@FPR=0.001",
+    "AA train",
+    "AA test",
+    "Privacy loss",
+    "AF_MAE",
+    "AF_Pearson",
+    "W distance",
+    "real_vs_synth_AUC",
+]
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -20,9 +46,12 @@ from attacks.random.random_attack import RandomAttack
 from attacks.MonteCarlo.MonteCarlo_attack import MonteCarlo_attack
 from attacks.ReconstructionLossAttack.reconstruction_loss_attack import ReconstructionLossAttack
 from attacks.CriticScoreAttack.critic_score_attack import CriticScoreAttack
+from attacks.DiscriminatorScoreAttack.discriminator_score_attack import DiscriminatorScoreAttack
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper 
+from models.evaluate_model_quality import evaluate_model_quality
 from models.models_factory import create_model_wrapper
 from AA_Simulation.measurements import calc_AA
+from utils.device import get_device, get_gpu_memory_gb, get_memory_based_batch_size
 
 
 # Define paths
@@ -31,9 +60,13 @@ results_folder = "attacks/results"
 
 # Development filter. Set to None to attack every checkpoint in models_folder.
 # Examples:
-#   MODEL_NAME_REGEX = r"^WGAN.*\.pth$"
-#   MODEL_NAME_REGEX = r"^(WGAN|VAE)_model_last_model\.pth$"
-MODEL_NAME_REGEX = r"^VAE.*\.pth$"
+# MODEL_NAME_REGEX = r"^AC_GAN_model_\d+\.index$"
+MODEL_NAME_REGEX = r"^(WGAN|VAE)_model_\d+\.pth$"
+# MODEL_NAME_REGEX = r"^WGAN_model_(0|10000)\.pth$"
+# MODEL_NAME_REGEX = r"^(WGAN_model_(1000|10000)|VAE_model_10000)\.pth$"
+# MODEL_NAME_REGEX = r"^WGAN_model_\d+\.pth$"
+# MODEL_NAME_REGEX = r"^VAE.*\.pth$"
+# MODEL_NAME_REGEX = r"^WGAN_model_10000\.pth$"
 MAX_TEST_SET_SIZE = 1000
 TEST_PREDICTION_BATCH_SIZE = 32
 MONTE_CARLO_N_SAMPLES = 1000000
@@ -41,7 +74,11 @@ MONTE_CARLO_D_MIN_N_SAMPLES = 1000
 MONTE_CARLO_GENERATION_BATCH_SIZE = 2048
 SYNTHETIC_CACHE_BATCH_SIZE = 2048
 CANDIDATE_BATCH_SIZE = 32
-MODEL_GENERATION_BATCH_SIZE = 256
+MODEL_GENERATION_BATCH_SIZE = get_memory_based_batch_size(  
+    small_batch_size=8,
+    large_batch_size=512,
+    large_gpu_memory_gb=16,
+)
 # TEST_PREDICTION_BATCH_SIZE = 32000
 # MONTE_CARLO_N_SAMPLES = 1000000
 # MONTE_CARLO_D_MIN_N_SAMPLES = 10000
@@ -49,8 +86,18 @@ MODEL_GENERATION_BATCH_SIZE = 256
 # SYNTHETIC_CACHE_BATCH_SIZE = 8192
 # CANDIDATE_BATCH_SIZE = 128
 # MODEL_GENERATION_BATCH_SIZE = 512
-SYNTHETIC_CACHE_DIR = Path(results_folder) / "tmp_synthetic"
 BALANCED_ACCURACY_THRESHOLD = 0.5
+CRITIC_SCORE_DIAGNOSTIC_MAX_SAMPLES = MAX_TEST_SET_SIZE
+RECONSTRUCTION_LOSS_DIAGNOSTIC_MAX_SAMPLES = MAX_TEST_SET_SIZE
+DISCRIMINATOR_SCORE_DIAGNOSTIC_MAX_SAMPLES = MAX_TEST_SET_SIZE
+RUN_MODEL_QUALITY_EVALUATION = True
+MODEL_QUALITY_N_SAMPLES = MAX_TEST_SET_SIZE
+MODEL_QUALITY_PCA_PLOT_SAMPLES = MAX_TEST_SET_SIZE
+MODEL_QUALITY_AA_SAMPLES = 200
+MODEL_QUALITY_CLASSIFIER_PCA_COMPONENTS = 50
+MODEL_QUALITY_RANDOM_SEED = 42
+DEVICE = get_device()
+GPU_MEMORY_GB = get_gpu_memory_gb()
 
 os.makedirs(results_folder, exist_ok=True)
 
@@ -58,7 +105,15 @@ os.makedirs(results_folder, exist_ok=True)
 def get_model_files(models_dir, model_name_regex=None):
     """Return checkpoint files selected by an optional filename regex."""
     models_path = Path(models_dir)
-    model_files = sorted(path for path in models_path.glob("*.pth") if path.is_file())
+    model_files = sorted(
+        (
+            path
+            for pattern in ("*.pth", "*.index")
+            for path in models_path.glob(pattern)
+            if path.is_file()
+        ),
+        key=lambda path: path.name,
+    )
 
     if model_name_regex is None:
         return model_files
@@ -73,14 +128,17 @@ def save_attack_results(model_name, attack_results, output_dir):
     summary_data_list = []
     for attack_name, data in attack_results.items():
         attack_metrics = data["metrics"]
+        attack_display_name = data.get("display_name", attack_name)
         summary_data = {
             "model": model_name,
             "attack": attack_name,
+            "attack_display_name": attack_display_name,
             "tp": attack_metrics["tp"],
             "tn": attack_metrics["tn"],
             "fp": attack_metrics["fp"],
             "fn": attack_metrics["fn"],
             "accuracy": attack_metrics["accuracy"],
+            "accuracy_threshold_0_5": attack_metrics["accuracy_threshold_0_5"],
             "optimal_accuracy": attack_metrics["optimal_accuracy"],
             "optimal_accuracy_threshold": attack_metrics["optimal_accuracy_threshold"],
             "precision": attack_metrics["precision"],
@@ -112,6 +170,93 @@ def save_attack_results(model_name, attack_results, output_dir):
 
 def save_attack_metrics(model_name, attack_results, output_dir):
     return save_attack_results(model_name, attack_results, output_dir)
+
+
+def accuracy_at_fpr(y_true, scores, target_fpr=0.01):
+    """Return accuracy at the ROC threshold with FPR nearest to, but not above, target_fpr."""
+    y_true = np.asarray(y_true).astype(int)
+    scores = np.asarray(scores)
+    fpr, _, thresholds = roc_curve(y_true, scores)
+    valid_indices = np.where(fpr <= target_fpr)[0]
+    if len(valid_indices) > 0:
+        threshold_index = valid_indices[-1]
+    else:
+        threshold_index = int(np.argmin(np.abs(fpr - target_fpr)))
+
+    threshold = thresholds[threshold_index]
+    predictions = (scores >= threshold).astype(int)
+    return float(np.mean(predictions == y_true))
+
+
+def build_run_summary_rows(model_name, attack_results, quality_metrics=None, model_type=None):
+    """Build compact model/attack rows for the run summary CSV."""
+    quality_metrics = quality_metrics or {}
+    if model_type is None:
+        model_type = GenomeGenerativeModelWrapper.infer_model_type(model_name)
+    rows = []
+    for attack_name, data in attack_results.items():
+        attack_metrics = data["metrics"]
+        attack_display_name = data.get("display_name", attack_name)
+        rows.append(
+            {
+                "Model name": model_name,
+                "Model type": model_type,
+                "Attack type": attack_name,
+                "Attack": attack_display_name,
+                "Accuracy @FPR=0.01": accuracy_at_fpr(
+                    data["true_labels"],
+                    data["scores"],
+                    target_fpr=0.01,
+                ),
+                "Accuracy @0.5": attack_metrics["accuracy_threshold_0_5"],
+                "AUC": attack_metrics["auc"],
+                "TPR@FPR=0.01": attack_metrics["tpr_01"],
+                "TPR@FPR=0.001": attack_metrics["tpr_001"],
+                "AA train": attack_metrics["AA_train"],
+                "AA test": attack_metrics["AA_test"],
+                "Privacy loss": attack_metrics["privacy_loss"],
+                "AF_MAE": quality_metrics.get("allele_frequency_mae", np.nan),
+                "AF_Pearson": quality_metrics.get("allele_frequency_pearson", np.nan),
+                "W distance": quality_metrics.get("pca_wasserstein_distance", np.nan),
+                "real_vs_synth_AUC": quality_metrics.get(
+                    "real_vs_synthetic_classifier_auc",
+                    np.nan,
+                ),
+            }
+        )
+    return rows
+
+
+def create_run_output_dir(base_output_dir):
+    """Create a unique timestamped directory for this script run."""
+    base_output_dir = Path(base_output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = base_output_dir / timestamp
+    suffix = 2
+    while output_dir.exists():
+        output_dir = base_output_dir / f"{timestamp}_{suffix:02d}"
+        suffix += 1
+    output_dir.mkdir(parents=True)
+    return output_dir
+
+
+def create_run_summary_path(output_dir):
+    return Path(output_dir) / "attack_model_results.csv"
+
+
+def initialize_run_summary(output_path):
+    pd.DataFrame(columns=RUN_SUMMARY_COLUMNS).to_csv(output_path, index=False)
+    return output_path
+
+
+def append_run_summary_rows(rows, output_path):
+    pd.DataFrame(rows, columns=RUN_SUMMARY_COLUMNS).to_csv(
+        output_path,
+        mode="a",
+        header=False,
+        index=False,
+    )
+    return output_path
 
 
 def save_attack_predictions(
@@ -154,7 +299,11 @@ def save_attack_predictions(
     pd.DataFrame(prediction_data).to_csv(out_path, index=False)
     return out_path
 
+
 def call_AA_dist_metrics(training_points, test_points, synth_points):
+        training_points = as_aa_matrix(training_points, "training_points")
+        test_points = as_aa_matrix(test_points, "test_points")
+        synth_points = as_aa_matrix(synth_points, "synth_points")
 
         AAtr, real2real_dists_tr, real2synth_dists_tr, synth2synth_dists_tr = calc_AA(training_points, synth_points)
         AAte, real2real_dists_te, real2synth_dists_te, synth2synth_dists_te = calc_AA(test_points, synth_points)
@@ -162,6 +311,19 @@ def call_AA_dist_metrics(training_points, test_points, synth_points):
         privacy_loss = AAte - AAtr
 
         return AAtr, AAte, privacy_loss
+
+
+def as_aa_matrix(points, name):
+    matrix = np.asarray(points, dtype=np.float32)
+    if matrix.ndim != 2:
+        raise ValueError(f"{name} must be a 2D matrix, got shape {matrix.shape}")
+    if matrix.shape[0] < 2:
+        raise ValueError(f"{name} must contain at least 2 samples, got shape {matrix.shape}")
+    if matrix.shape[1] < 1:
+        raise ValueError(f"{name} must contain at least 1 feature, got shape {matrix.shape}")
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{name} contains NaN or infinite values")
+    return matrix
 
 
 # TPR at fixed FPR
@@ -265,9 +427,12 @@ def predict_attack_in_batches(
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         batch_indices = indices[start:end]
+        batch_predict_kwargs = dict(predict_kwargs)
+        if "class_ids" in batch_predict_kwargs and batch_predict_kwargs["class_ids"] is not None:
+            batch_predict_kwargs["class_ids"] = batch_predict_kwargs["class_ids"][batch_indices]
         batch_predictions, batch_scores = attack_instance.predict(
             data[batch_indices],
-            **predict_kwargs,
+            **batch_predict_kwargs,
         )
         batch_predictions = np.asarray(batch_predictions)
         batch_scores = np.asarray(batch_scores)
@@ -327,15 +492,29 @@ def plot_roc_curve(y_true, scores, title="ROC Curve", show=False, save_path=None
     """Plot ROC curve for binary scores."""
     fpr, tpr, thresholds = roc_curve(y_true, scores)
     auc = roc_auc_score(y_true, scores)
+    target_fpr = 0.01
+    tpr_at_target_fpr = np.interp(target_fpr, fpr, tpr)
 
-    plt.figure(figsize=(6, 6))
+    plt.figure(figsize=PLOT_FIG_SIZE)
     plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
     plt.plot([0, 1], [0, 1], linestyle="--", label="Random (AUC=0.5)")
-    plt.xlabel("False Positive Rate (FPR)")
-    plt.ylabel("True Positive Rate (TPR)")
-    plt.title(title)
-    plt.legend()
+    plt.scatter(target_fpr, tpr_at_target_fpr, color="tab:red", zorder=3)
+    plt.annotate(
+        f"TPR @ FPR = 0.01: {tpr_at_target_fpr:.3f}",
+        xy=(target_fpr, tpr_at_target_fpr),
+        xytext=(0.30, 0.12),
+        textcoords="axes fraction",
+        arrowprops={"arrowstyle": "->", "color": "tab:red"},
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "tab:red", "alpha": 0.9},
+        fontsize=PLOT_CALLOUT_FONT_SIZE,
+    )
+    plt.xlabel("False Positive Rate (FPR)", fontsize=PLOT_LABEL_FONT_SIZE)
+    plt.ylabel("True Positive Rate (TPR)", fontsize=PLOT_LABEL_FONT_SIZE)
+    plt.title(title, fontsize=PLOT_TITLE_FONT_SIZE)
+    plt.legend(loc="center right", fontsize=PLOT_LEGEND_FONT_SIZE)
+    plt.tick_params(axis="both", labelsize=PLOT_TICK_FONT_SIZE)
     plt.grid(True)
+    plt.tight_layout()
 
     if save_path is not None:
         plt.savefig(save_path, bbox_inches="tight")
@@ -353,6 +532,12 @@ def run_attacks(
     load_n=500,
     max_test_set_size=None,
     synthetic_cache_key=None,
+    run_summary_rows=None,
+    run_summary_path=None,
+    quality_metrics=None,
+    model_type=None,
+    output_dir=results_folder,
+    synthetic_cache_dir=None,
 ) -> dict:
     """Run a set of attacks on a model wrapper.
 
@@ -370,6 +555,8 @@ def run_attacks(
         dict: summary of attack metrics.
     """
     results = {}
+    quality_metrics = quality_metrics or {}
+    output_dir = Path(output_dir)
     AA_n = 100
 
 
@@ -393,14 +580,25 @@ def run_attacks(
 
     # Load a bounded sample of data for the attack/evaluation split.
 
-    train_path_df = pd.read_csv(train_path, sep=' ', header=None, nrows=load_n)
-    train_data = train_path_df.drop(train_path_df.columns[0:2], axis=1).values
-
-    attack_train_path_df = pd.read_csv(attack_train_path, sep=' ', header=None, nrows=load_n)
-    attack_train_data = attack_train_path_df.drop(attack_train_path_df.columns[0:2], axis=1).values
-
-    non_train_path_df = pd.read_csv(non_train_path, sep=' ', header=None, nrows=load_n)
-    non_train_data = non_train_path_df.drop(non_train_path_df.columns[0:2], axis=1).values
+    train_data = model.load_attack_dataset(train_path, nrows=load_n)
+    attack_train_data = model.load_attack_dataset(attack_train_path, nrows=load_n)
+    non_train_data = model.load_attack_dataset(non_train_path, nrows=load_n)
+    train_class_ids = model.load_attack_labels(train_path, nrows=load_n)
+    attack_train_class_ids = model.load_attack_labels(attack_train_path, nrows=load_n)
+    non_train_class_ids = model.load_attack_labels(non_train_path, nrows=load_n)
+    print(
+        "Loaded attack datasets: "
+        f"train={train_data.shape}/{train_data.dtype}, "
+        f"eval={attack_train_data.shape}/{attack_train_data.dtype}, "
+        f"test={non_train_data.shape}/{non_train_data.dtype}"
+    )
+    if train_class_ids is not None:
+        print(
+            "Loaded attack class labels: "
+            f"train={train_class_ids.shape}, "
+            f"eval={attack_train_class_ids.shape}, "
+            f"test={non_train_class_ids.shape}"
+        )
 
     rng = np.random.default_rng(42)
 
@@ -416,11 +614,20 @@ def run_attacks(
 
     train_samples = train_data[idx_train]
     non_train_samples = non_train_data[idx_non]
+    train_sample_class_ids = (
+        train_class_ids[idx_train] if train_class_ids is not None else None
+    )
+    non_train_sample_class_ids = (
+        non_train_class_ids[idx_non] if non_train_class_ids is not None else None
+    )
     y_train = np.ones(n, dtype=int)      # members
     y_non = np.zeros(n, dtype=int)       # non-members
 
     X = np.concatenate([train_samples, non_train_samples], axis=0)
     y = np.concatenate([y_train, y_non], axis=0)
+    X_class_ids = None
+    if train_sample_class_ids is not None and non_train_sample_class_ids is not None:
+        X_class_ids = np.concatenate([train_sample_class_ids, non_train_sample_class_ids], axis=0)
 
     perm = rng.permutation(len(X))
     if max_test_set_size is not None:
@@ -439,18 +646,28 @@ def run_attacks(
         #     generation_batch_size=MONTE_CARLO_GENERATION_BATCH_SIZE,
         #     distance_metric="euclidean",
         #     candidate_batch_size=CANDIDATE_BATCH_SIZE,
-        #     synthetic_cache_dir=SYNTHETIC_CACHE_DIR,
+        #     synthetic_cache_dir=synthetic_cache_dir,
         #     synthetic_cache_batch_size=SYNTHETIC_CACHE_BATCH_SIZE,
         #     synthetic_cache_key=synthetic_cache_key,
         # ),
-        # CriticScoreAttack(n_repeats=3, batch_size=16),
-        ReconstructionLossAttack()
+        CriticScoreAttack(n_repeats=1, batch_size=16, pack_mode="repeat_candidate"),
+        ReconstructionLossAttack(),
+        # DiscriminatorScoreAttack(discriminator_weight=1.0, class_confidence_weight=0.0, batch_size=8),
+        # DiscriminatorScoreAttack(discriminator_weight=0.0, class_confidence_weight=1.0, batch_size=8, class_confidence_mode="predicted_class"),
+        # DiscriminatorScoreAttack(discriminator_weight=0.5, class_confidence_weight=0.5, batch_size=8, class_confidence_mode="predicted_class"),
+        # DiscriminatorScoreAttack(discriminator_weight=0.0, class_confidence_weight=1.0, batch_size=8, class_confidence_mode="true_class"),
+        # DiscriminatorScoreAttack(discriminator_weight=0.5, class_confidence_weight=0.5, batch_size=8, class_confidence_mode="true_class"),
     ]  # Attack instances
 
     attack_thresholds = {
         "monte_carlo_attack": 0.99,
         "reconstruction_loss_attack": 0.99,
         "critic_score_attack": 0.99,
+        "discriminator_score_attack_d1p00_c0p00": 0.99,
+        "discriminator_score_attack_d0p00_c1p00_predicted_class": 0.99,
+        "discriminator_score_attack_d0p50_c0p50_predicted_class": 0.99,
+        "discriminator_score_attack_d0p00_c1p00_true_class": 0.99,
+        "discriminator_score_attack_d0p50_c0p50_true_class": 0.99,
     }
 
     synthetic_samples = model.generate(n=aa_n)
@@ -464,15 +681,151 @@ def run_attacks(
             continue
 
         attack_name = attack_instance.name
-        print(f"Running attack: {attack_name}")
+        attack_display_name = attack_instance.get_display_name()
+        print(f"Running attack: {attack_display_name} ({attack_name})")
         if attack_name == "monte_carlo_attack" and attack_instance.synthetic_cache_path is not None:
             print(f"Using synthetic cache for Monte Carlo attack: {attack_instance.synthetic_cache_path}")
 
+        fit_kwargs = {}
+        if isinstance(attack_instance, DiscriminatorScoreAttack):
+            if attack_instance.requires_true_labels and (
+                attack_train_class_ids is None or X_class_ids is None
+            ):
+                raise ValueError(
+                    "True class labels are required for label-aware "
+                    f"discriminator attack {attack_name}"
+                )
+            fit_kwargs["non_train_labels"] = attack_train_class_ids
         attack_instance.fit(
             non_train_data=attack_train_data,
             thr=attack_thresholds.get(attack_name, 0.5),
             modelWrapper=model,
+            **fit_kwargs,
         )  # Fit on synthetic and non-training samples
+
+        if attack_name.startswith("discriminator_score_attack"):
+            diagnostic_n = min(
+                DISCRIMINATOR_SCORE_DIAGNOSTIC_MAX_SAMPLES,
+                len(train_samples),
+                len(non_train_samples),
+            )
+            train_diagnostic_labels = (
+                train_sample_class_ids[:diagnostic_n]
+                if train_sample_class_ids is not None else None
+            )
+            non_train_diagnostic_labels = (
+                non_train_sample_class_ids[:diagnostic_n]
+                if non_train_sample_class_ids is not None else None
+            )
+            diagnostic = attack_instance.score_diagnostic(
+                train_samples[:diagnostic_n],
+                non_train_samples[:diagnostic_n],
+                train_labels=train_diagnostic_labels,
+                non_train_labels=non_train_diagnostic_labels,
+                model_name=model.model_name,
+                output_dir=output_dir,
+            )
+            print(
+                "Discriminator score diagnostic "
+                f"(n={diagnostic_n}, "
+                f"disc_weight={diagnostic['discriminator_weight']:.2f}, "
+                f"class_weight={diagnostic['class_confidence_weight']:.2f}, "
+                f"class_mode={diagnostic['class_confidence_mode']}): "
+                f"train_mean={diagnostic['train_mean']:.6f}, "
+                f"train_median={diagnostic['train_median']:.6f}, "
+                f"train_range=[{diagnostic['train_min']:.6f}, "
+                f"{diagnostic['train_max']:.6f}], "
+                f"non_train_mean={diagnostic['non_train_mean']:.6f}, "
+                f"non_train_median={diagnostic['non_train_median']:.6f}, "
+                f"non_train_range=[{diagnostic['non_train_min']:.6f}, "
+                f"{diagnostic['non_train_max']:.6f}]"
+            )
+            print(
+                "Saved per-sample discriminator score diagnostic: "
+                f"{diagnostic['path']}"
+            )
+            print(
+                "Saved discriminator score distribution plot: "
+                f"{diagnostic['plot_path']}"
+            )
+
+        if attack_name == "critic_score_attack":
+            diagnostic_n = min(
+                CRITIC_SCORE_DIAGNOSTIC_MAX_SAMPLES,
+                len(train_samples),
+                len(non_train_samples),
+            )
+            diagnostic_synthetic_samples = model.generate(n=diagnostic_n)
+            diagnostic = attack_instance.raw_score_diagnostic(
+                train_samples[:diagnostic_n],
+                non_train_samples[:diagnostic_n],
+                diagnostic_synthetic_samples,
+                model_name=model.model_name,
+                output_dir=output_dir,
+            )
+            print(
+                "Critic raw score diagnostic "
+                f"(n={diagnostic_n}, pack_mode={diagnostic['pack_mode']}): "
+                f"train_mean={diagnostic['train_mean']:.6f}, "
+                f"train_median={diagnostic['train_median']:.6f}, "
+                f"train_range=[{diagnostic['train_min']:.6f}, "
+                f"{diagnostic['train_max']:.6f}], "
+                f"non_train_mean={diagnostic['non_train_mean']:.6f}, "
+                f"non_train_median={diagnostic['non_train_median']:.6f}, "
+                f"non_train_range=[{diagnostic['non_train_min']:.6f}, "
+                f"{diagnostic['non_train_max']:.6f}], "
+                f"synthetic_mean={diagnostic['synthetic_mean']:.6f}, "
+                f"synthetic_median={diagnostic['synthetic_median']:.6f}, "
+                f"synthetic_range=[{diagnostic['synthetic_min']:.6f}, "
+                f"{diagnostic['synthetic_max']:.6f}]"
+            )
+            print(
+                "Saved per-sample critic raw score diagnostic: "
+                f"{diagnostic['path']}"
+            )
+            print(
+                "Saved critic raw score distribution plot: "
+                f"{diagnostic['plot_path']}"
+            )
+
+        if attack_name == "reconstruction_loss_attack":
+            diagnostic_n = min(
+                RECONSTRUCTION_LOSS_DIAGNOSTIC_MAX_SAMPLES,
+                len(train_samples),
+                len(non_train_samples),
+            )
+            diagnostic_synthetic_samples = model.generate(n=diagnostic_n)
+            diagnostic = attack_instance.reconstruction_loss_diagnostic(
+                train_samples[:diagnostic_n],
+                non_train_samples[:diagnostic_n],
+                diagnostic_synthetic_samples,
+                model_name=model.model_name,
+                output_dir=output_dir,
+            )
+            print(
+                "Reconstruction loss diagnostic "
+                f"(n={diagnostic_n}): "
+                f"train_mean={diagnostic['train_mean']:.6f}, "
+                f"train_median={diagnostic['train_median']:.6f}, "
+                f"train_range=[{diagnostic['train_min']:.6f}, "
+                f"{diagnostic['train_max']:.6f}], "
+                f"non_train_mean={diagnostic['non_train_mean']:.6f}, "
+                f"non_train_median={diagnostic['non_train_median']:.6f}, "
+                f"non_train_range=[{diagnostic['non_train_min']:.6f}, "
+                f"{diagnostic['non_train_max']:.6f}], "
+                f"synthetic_mean={diagnostic['synthetic_mean']:.6f}, "
+                f"synthetic_median={diagnostic['synthetic_median']:.6f}, "
+                f"synthetic_range=[{diagnostic['synthetic_min']:.6f}, "
+                f"{diagnostic['synthetic_max']:.6f}]"
+            )
+            print(
+                "Saved per-sample reconstruction loss diagnostic: "
+                f"{diagnostic['path']}"
+            )
+            print(
+                "Saved reconstruction loss distribution plot: "
+                f"{diagnostic['plot_path']}"
+            )
 
         predictions, scores, raw_scores = predict_attack_in_batches(
             attack_instance,
@@ -480,6 +833,9 @@ def run_attacks(
             perm,
             TEST_PREDICTION_BATCH_SIZE,
             labels=y,
+            predict_kwargs={
+                "class_ids": X_class_ids,
+            } if isinstance(attack_instance, DiscriminatorScoreAttack) else None,
         )
         inside_d_min_percent = None
         if attack_name == "monte_carlo_attack" and raw_scores is not None:
@@ -503,6 +859,14 @@ def run_attacks(
 
         predictions_threshold_0_5 = predictions_at_threshold(scores)
         eval_metrics = evaluate_predictions(test_labels, predictions, scores)
+        eval_metrics_threshold_0_5 = evaluate_predictions(
+            test_labels,
+            predictions_threshold_0_5,
+            scores,
+        )
+        eval_metrics["accuracy_threshold_0_5"] = (
+            eval_metrics_threshold_0_5["accuracy"]
+        )
         optimal_accuracy, optimal_accuracy_threshold = optimal_accuracy_from_scores(
             test_labels,
             scores,
@@ -551,10 +915,17 @@ def run_attacks(
             threshold_message += (
                 f", Raw threshold @ 0.5: {raw_threshold_0_5:.6f}"
             )
+        threshold_label = (
+            f"{prediction_threshold:.4f}"
+            if prediction_threshold is not None else "attack default"
+        )
 
         print(
-            f"Attack: {attack_name}, "
-            f"Accuracy: {eval_metrics['accuracy']:.4f}, "
+            f"Attack: {attack_display_name}, "
+            f"Accuracy @ threshold {threshold_label}: "
+            f"{eval_metrics['accuracy']:.4f}, "
+            f"Accuracy @ threshold 0.5: "
+            f"{eval_metrics_threshold_0_5['accuracy']:.4f}, "
             f"Optimal Accuracy: {eval_metrics['optimal_accuracy']:.4f}, "
             f"Optimal Accuracy Threshold: "
             f"{eval_metrics['optimal_accuracy_threshold']:.4f}, "
@@ -570,7 +941,7 @@ def run_attacks(
             test_labels,
             predictions,
             scores,
-            results_folder,
+            output_dir,
             sample_indices=perm,
             raw_scores=raw_scores,
             inside_d_min_percent=inside_d_min_percent,
@@ -589,6 +960,7 @@ def run_attacks(
         print(f"Saved prediction log: {prediction_path}{raw_log_message}")
 
         results[attack_name] = {
+            "display_name": attack_display_name,
             "metrics": eval_metrics,
             "true_labels": test_labels,
             "predictions": predictions,
@@ -598,12 +970,23 @@ def run_attacks(
             "inside_d_min_percent": inside_d_min_percent,
         }
 
+        if run_summary_rows is not None and run_summary_path is not None:
+            new_summary_rows = build_run_summary_rows(
+                model.model_name,
+                {attack_name: results[attack_name]},
+                quality_metrics=quality_metrics,
+                model_type=model_type,
+            )
+            run_summary_rows.extend(new_summary_rows)
+            append_run_summary_rows(new_summary_rows, run_summary_path)
+            print(f"Updated run summary CSV: {run_summary_path}")
+
         plot_roc_curve(
             test_labels,
             scores,
-            title=f"ROC Curve - {attack_name}",
+            title=f"ROC Curve - {attack_display_name}\n{model.get_model_title_suffix()}",
             show=False,
-            save_path=f"{results_folder}/{model.model_name}_{attack_name}_roc.png"
+            save_path=output_dir / f"{model.model_name}_{attack_name}_roc.png"
 
         )
 
@@ -612,29 +995,69 @@ def run_attacks(
 
 # Create results folder if it doesn't exist
 os.makedirs(results_folder, exist_ok=True)
+run_output_dir = create_run_output_dir(results_folder)
+synthetic_cache_dir = Path(results_folder) / "tmp_synthetic"
+print(f"Writing run artifacts under: {run_output_dir}")
+print(f"Using shared synthetic cache under: {synthetic_cache_dir}")
 
 model_files = get_model_files(models_folder, MODEL_NAME_REGEX)
 if MODEL_NAME_REGEX is not None:
     print(f"Using model filename regex: {MODEL_NAME_REGEX}")
 print(f"Found {len(model_files)} model checkpoint(s) to attack.")
+if model_files:
+    print("Model execution order:")
+    for model_index, model_file in enumerate(model_files, start=1):
+        print(f"  {model_index}. {model_file.name}")
+print(f"Using device: {DEVICE}, GPU memory: {GPU_MEMORY_GB:.2f} GB")
+
+run_summary_rows = []
+run_summary_path = create_run_summary_path(run_output_dir)
+initialize_run_summary(run_summary_path)
+print(f"Writing incremental run summary CSV: {run_summary_path}")
 
 # Loop over selected models in the folder
 for model_file in model_files:
     print(f"\nProcessing model: {model_file.name}")
     
     # Build wrapper from model file
-    model = create_model_wrapper(file_name=str(model_file))
+    model = create_model_wrapper(
+        file_name=str(model_file),
+        device=DEVICE,
+        generation_batch_size=MODEL_GENERATION_BATCH_SIZE,
+    )
     if hasattr(model, "generation_batch_size"):
-        model.generation_batch_size = MODEL_GENERATION_BATCH_SIZE
         print(f"Using model generation batch size: {model.generation_batch_size}")
     print(f"Using wrapper model architecture: {model.get_model_architecture()}")
 
-    # Generate dataset paths based on model file name
     base = model_file.stem
-    train_path = f"{models_folder}/{base}_train.hapt"
-    eval_path = f"{models_folder}/{base}_eval.hapt"
-    test_path = f"{models_folder}/{base}_test.hapt"
+    attack_dataset_paths = model.get_attack_dataset_paths(models_folder, base)
+    train_path = attack_dataset_paths["train"]
+    eval_path = attack_dataset_paths["eval"]
+    test_path = attack_dataset_paths["test"]
     print(f"Dataset paths: Train: {train_path}, Eval: {eval_path}, Test: {test_path}")
+
+    quality_metrics = {}
+    if RUN_MODEL_QUALITY_EVALUATION:
+        print(f"Running quality evaluation on {model_file.name}...")
+        quality_results = evaluate_model_quality(
+            model=model,
+            real_path=test_path,
+            output_dir=run_output_dir,
+            n_samples=MODEL_QUALITY_N_SAMPLES,
+            pca_plot_samples=MODEL_QUALITY_PCA_PLOT_SAMPLES,
+            aa_samples=MODEL_QUALITY_AA_SAMPLES,
+            pca_components=MODEL_QUALITY_CLASSIFIER_PCA_COMPONENTS,
+            seed=MODEL_QUALITY_RANDOM_SEED,
+        )
+        quality_metrics = quality_results["metrics"]
+        print(
+            f"Quality metrics for {model.model_name}: "
+            f"AF_MAE={quality_metrics['allele_frequency_mae']:.4f}, "
+            f"AF_Pearson={quality_metrics['allele_frequency_pearson']:.4f}, "
+            f"W_distance={quality_metrics['pca_wasserstein_distance']:.4f}, "
+            f"AA={quality_metrics.get('aa', np.nan):.4f}, "
+            f"real_vs_synth_AUC={quality_metrics['real_vs_synthetic_classifier_auc']:.4f}"
+        )
 
     # Run attacks
     print(f"Running attacks on {model_file.name}...")
@@ -645,9 +1068,15 @@ for model_file in model_files:
         test_path,
         max_test_set_size=MAX_TEST_SET_SIZE,
         synthetic_cache_key=f"{base}_{model_file.stat().st_mtime_ns}",
+        run_summary_rows=run_summary_rows,
+        run_summary_path=run_summary_path,
+        quality_metrics=quality_metrics,
+        model_type=model.get_model_type(),
+        output_dir=run_output_dir,
+        synthetic_cache_dir=synthetic_cache_dir,
     )
 
-    metric_paths = save_attack_results(model.model_name, attack_results, results_folder)
+    metric_paths = save_attack_results(model.model_name, attack_results, run_output_dir)
     for metric_path in metric_paths:
         print(f"Saved metrics log: {metric_path}")
 

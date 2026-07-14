@@ -18,7 +18,7 @@ from torch.nn import functional as F
 inpt = "Data/1000G_real_genomes/10K_SNP_1000G_real_PADDED_train.hapt" #hdf format input file
 eval_inpt = "Data/1000G_real_genomes/10K_SNP_1000G_real_PADDED_eval.hapt" #hdf format input file
 
-out_dir = "./output_dir"
+out_dir = "./models/VAE/checkpoints"
 model_name = "VAE_model"
 epochs = 10001
 lr = 0.001
@@ -31,6 +31,7 @@ save_that = 100 #epoch interval for saving outputs
 noise_dim = 1 #dimension of latent_space
 
 device = torch.device("cuda:0" if (torch.cuda.is_available() and gpu > 0) else "cpu")
+os.makedirs(out_dir, exist_ok=True)
 
 ## Prepare the training data
 #df = pd.read_hdf(inpt, key="df1", mode='r')

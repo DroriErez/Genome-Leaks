@@ -9,6 +9,10 @@ class attack(ABC):
     def __init__(self) -> None:
         self.is_fitted = False
 
+    def get_display_name(self) -> str:
+        """Return a human-readable name for plots and reports."""
+        return self.name.replace("_", " ").title()
+
     def fit(self, non_train_data: np.ndarray, thr: float = 0.5, modelWrapper=None) -> None:
         self.modelWrapper = modelWrapper
         self.threshold = thr

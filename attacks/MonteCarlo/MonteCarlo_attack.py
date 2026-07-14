@@ -103,6 +103,9 @@ class MonteCarlo_attack(attack):
         self.last_raw_scores = None
         self._cleanup_counter = 0
 
+    def get_display_name(self) -> str:
+        return "Monte Carlo Attack"
+
     def fit(
         self,
         non_train_data: np.ndarray,
