@@ -35,11 +35,11 @@ def build_generator(latent_dim: int, num_classes: int, number_of_genotypes: int,
     generator.add(
         Dense(int(number_of_genotypes // 1.3), input_shape=(latent_dim + NUMBER_REPEAT_CLASS_VECTOR * num_classes,),
               kernel_regularizer=regularizers.l2(0.0001)))
-    generator.add(LeakyReLU(alpha=alph))
+    generator.add(LeakyReLU(negative_slope=alph))
     generator.add(Dense(int(number_of_genotypes // 1.2), kernel_regularizer=regularizers.l2(0.0001)))
-    generator.add(LeakyReLU(alpha=alph))
+    generator.add(LeakyReLU(negative_slope=alph))
     generator.add(Dense(int(number_of_genotypes // 1.1), kernel_regularizer=regularizers.l2(0.0001)))
-    generator.add(LeakyReLU(alpha=alph))
+    generator.add(LeakyReLU(negative_slope=alph))
     generator.add(Dense(number_of_genotypes, activation='tanh'))
 
     # Generating the output image
@@ -60,13 +60,13 @@ def build_discriminator(number_of_genotypes: int, num_classes: int, alph: float,
     discriminator.add(
         Dense(number_of_genotypes // 2, input_shape=(number_of_genotypes,), kernel_regularizer=regularizers.l2(0.0001)))
 
-    discriminator.add(LeakyReLU(alpha=alph))
+    discriminator.add(LeakyReLU(negative_slope=alph))
     discriminator.add(Dropout(0.2))
     discriminator.add(Dense(number_of_genotypes // 3, kernel_regularizer=regularizers.l2(0.0001)))
-    discriminator.add(LeakyReLU(alpha=alph))
+    discriminator.add(LeakyReLU(negative_slope=alph))
     discriminator.add(Dropout(0.2))
     discriminator.add(Dense(number_of_genotypes // 4, kernel_regularizer=regularizers.l2(0.0001)))
-    discriminator.add(LeakyReLU(alpha=alph))
+    discriminator.add(LeakyReLU(negative_slope=alph))
     discriminator.add(Dropout(0.1))
     sequence = Input(shape=(number_of_genotypes,), dtype='float32')
 
@@ -131,16 +131,75 @@ def restore_latest_checkpoint(checkpoint, checkpoints_path: str):
     return checkpoint_epoch
 
 
-def save_checkpoints(checkpoint, checkpoints_path: str, epoch: int):
+def save_checkpoints(
+        checkpoint,
+        checkpoints_path: str,
+        epoch: int,
+        generator: Model = None,
+        discriminator: Model = None):
     epoch_checkpoint_path = os.path.join(checkpoints_path, f"{CHECKPOINT_NAME}_{epoch}")
     last_checkpoint_path = os.path.join(checkpoints_path, LAST_CHECKPOINT_NAME)
 
-    checkpoint.epoch.assign(epoch)
-    checkpoint.write(epoch_checkpoint_path)
-    checkpoint.write(last_checkpoint_path)
+    # TensorFlow object checkpoints are intentionally disabled here. The attack
+    # loader now prefers explicit standalone Keras component models.
+    # checkpoint.epoch.assign(epoch)
+    # checkpoint.write(epoch_checkpoint_path)
+    # checkpoint.write(last_checkpoint_path)
+    #
+    # print(f"Saved checkpoint: {epoch_checkpoint_path}")
+    # print(f"Saved latest checkpoint: {last_checkpoint_path}")
 
-    print(f"Saved checkpoint: {epoch_checkpoint_path}")
-    print(f"Saved latest checkpoint: {last_checkpoint_path}")
+    if generator is not None:
+        epoch_generator_model_path = os.path.join(
+            checkpoints_path,
+            f"{CHECKPOINT_NAME}_{epoch}_generator.keras",
+        )
+        last_generator_model_path = os.path.join(
+            checkpoints_path,
+            f"{LAST_CHECKPOINT_NAME}_generator.keras",
+        )
+        epoch_generator_weights_path = os.path.join(
+            checkpoints_path,
+            f"{CHECKPOINT_NAME}_{epoch}_generator.weights.h5",
+        )
+        last_generator_weights_path = os.path.join(
+            checkpoints_path,
+            f"{LAST_CHECKPOINT_NAME}_generator.weights.h5",
+        )
+        generator.save(epoch_generator_model_path)
+        generator.save(last_generator_model_path)
+        generator.save_weights(epoch_generator_weights_path)
+        generator.save_weights(last_generator_weights_path)
+        print(f"Saved generator model: {epoch_generator_model_path}")
+        print(f"Saved latest generator model: {last_generator_model_path}")
+        print(f"Saved generator weights: {epoch_generator_weights_path}")
+        print(f"Saved latest generator weights: {last_generator_weights_path}")
+
+    if discriminator is not None:
+        epoch_discriminator_model_path = os.path.join(
+            checkpoints_path,
+            f"{CHECKPOINT_NAME}_{epoch}_discriminator.keras",
+        )
+        last_discriminator_model_path = os.path.join(
+            checkpoints_path,
+            f"{LAST_CHECKPOINT_NAME}_discriminator.keras",
+        )
+        epoch_discriminator_weights_path = os.path.join(
+            checkpoints_path,
+            f"{CHECKPOINT_NAME}_{epoch}_discriminator.weights.h5",
+        )
+        last_discriminator_weights_path = os.path.join(
+            checkpoints_path,
+            f"{LAST_CHECKPOINT_NAME}_discriminator.weights.h5",
+        )
+        discriminator.save(epoch_discriminator_model_path)
+        discriminator.save(last_discriminator_model_path)
+        discriminator.save_weights(epoch_discriminator_weights_path)
+        discriminator.save_weights(last_discriminator_weights_path)
+        print(f"Saved discriminator model: {epoch_discriminator_model_path}")
+        print(f"Saved latest discriminator model: {last_discriminator_model_path}")
+        print(f"Saved discriminator weights: {epoch_discriminator_weights_path}")
+        print(f"Saved latest discriminator weights: {last_discriminator_weights_path}")
 
 
 def average_discriminator_score(discriminator: Model, x_values, batch_size: int = 64):
@@ -180,7 +239,7 @@ def print_checkpoint_discriminator_scores(epoch: int, discriminator: Model, trai
 
 
 def save_training_metrics(experiment_results_path: str, epoch: int, discriminator_loss: float, generator_loss: float,
-                          discriminator_scores: dict, generated_genomes_df):
+                          discriminator_scores: dict, generated_genomes_df, pca_metrics: dict = None):
     metrics_path = os.path.join(experiment_results_path, TRAINING_METRICS_FILE_NAME)
     write_header = not os.path.exists(metrics_path)
     memory_metrics = get_memory_metrics()
@@ -192,6 +251,7 @@ def save_training_metrics(experiment_results_path: str, epoch: int, discriminato
         "eval_discriminator_score": discriminator_scores["eval_score"],
         "synthetic_discriminator_score": discriminator_scores["synth_score"],
         "synthetic_samples": len(generated_genomes_df),
+        **(pca_metrics or {}),
         **memory_metrics,
     }
     pd.DataFrame([metrics]).to_csv(metrics_path, mode='a', header=write_header, index=False)
@@ -324,12 +384,16 @@ def train(batch_size: int, epochs: int, dataset: tuple, num_classes: int, latent
             discriminator_scores = print_checkpoint_discriminator_scores(e, discriminator, dataset, test_dataset,
                                                                          generated_genomes_df, batch_size=batch_size)
 
-            if should_save_training_metrics:
-                save_training_metrics(experiment_results_path, e, discriminator_loss, generator_loss,
-                                      discriminator_scores, generated_genomes_df)
+            pca_metrics = None
 
             if should_save_checkpoint:
-                save_checkpoints(checkpoint, checkpoints_path, e)
+                save_checkpoints(
+                    checkpoint,
+                    checkpoints_path,
+                    e,
+                    generator=generator,
+                    discriminator=discriminator,
+                )
                 save_models(generator=generator,
                             discriminator=discriminator,
                             acgan=acgan,
@@ -337,16 +401,20 @@ def train(batch_size: int, epochs: int, dataset: tuple, num_classes: int, latent
                             suffix="_last_model")
 
                 # plot PCA for all population and for each label
-                plot_pca_comparisons(generator=generator, epoch_number=e,
-                                     class_id_to_counts=class_id_to_counts,
-                                     experiment_results_path=experiment_results_path,
-                                     latent_size=latent_size, num_classes=num_classes, dataset=dataset,
-                                     id_to_class=id_to_class, real_class_names=real_class_names,
-                                     sequence_results_path=sequence_results_path,
-                                     total_generated_samples=synthetic_samples_number,
-                                     generated_genomes_df=generated_genomes_df)
+                pca_metrics = plot_pca_comparisons(generator=generator, epoch_number=e,
+                                                   class_id_to_counts=class_id_to_counts,
+                                                   experiment_results_path=experiment_results_path,
+                                                   latent_size=latent_size, num_classes=num_classes, dataset=dataset,
+                                                   id_to_class=id_to_class, real_class_names=real_class_names,
+                                                   sequence_results_path=sequence_results_path,
+                                                   total_generated_samples=synthetic_samples_number,
+                                                   generated_genomes_df=generated_genomes_df)
 
-            del generated_genomes_df, discriminator_scores
+            if should_save_training_metrics:
+                save_training_metrics(experiment_results_path, e, discriminator_loss, generator_loss,
+                                      discriminator_scores, generated_genomes_df, pca_metrics=pca_metrics)
+
+            del generated_genomes_df, discriminator_scores, pca_metrics
             gc.collect()
         del avg_d_loss, avg_g_loss
         gc.collect()

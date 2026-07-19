@@ -276,6 +276,111 @@ def save_metrics(metrics, output_path):
     pd.DataFrame([serializable]).to_csv(output_path.with_suffix(".csv"), index=False)
 
 
+def mean_pairwise_l1_distance(data, max_samples=200):
+    """Mean normalized L1 distance across sample pairs."""
+    data = np.asarray(data, dtype=np.float32)
+    if len(data) < 2:
+        return np.nan
+    data = data[: min(len(data), max_samples)]
+    pair_count = 0
+    distance_sum = 0.0
+    for i in range(len(data) - 1):
+        distances = np.mean(np.abs(data[i + 1 :] - data[i]), axis=1)
+        distance_sum += float(np.sum(distances))
+        pair_count += len(distances)
+    return distance_sum / pair_count if pair_count else np.nan
+
+
+def rounded_polymorphic_fraction(data):
+    data = np.asarray(data)
+    if data.size == 0:
+        return np.nan
+    allele_frequency = data.mean(axis=0)
+    return float(np.mean((allele_frequency > 0) & (allele_frequency < 1)))
+
+
+def save_generation_diagnostics(model, real, output_dir, n_samples):
+    """Save raw-vs-rounded generation diagnostics for wrappers that expose raw outputs."""
+    if not hasattr(model, "generate_raw"):
+        return None
+
+    raw = np.asarray(model.generate_raw(n=len(real)), dtype=np.float32)
+    rounded = raw.copy()
+    rounded[rounded < 0] = 0
+    rounded = np.rint(rounded).astype(np.float32, copy=False)
+
+    if raw.shape[1] != real.shape[1]:
+        min_width = min(raw.shape[1], real.shape[1])
+        real = real[:, :min_width]
+        raw = raw[:, :min_width]
+        rounded = rounded[:, :min_width]
+
+    raw_feature_std = np.std(raw, axis=0)
+    rounded_row_sums = np.sum(rounded, axis=1)
+    diagnostics = {
+        "model": model.model_name,
+        "n_samples": int(n_samples),
+        "n_snps": int(raw.shape[1]),
+        "raw_min": float(np.min(raw)),
+        "raw_max": float(np.max(raw)),
+        "raw_mean": float(np.mean(raw)),
+        "raw_std": float(np.std(raw)),
+        "raw_feature_std_mean": float(np.mean(raw_feature_std)),
+        "raw_feature_std_median": float(np.median(raw_feature_std)),
+        "raw_fraction_lt_0": float(np.mean(raw < 0)),
+        "raw_fraction_0_to_lt_0_5": float(np.mean((raw >= 0) & (raw < 0.5))),
+        "raw_fraction_gte_0_5": float(np.mean(raw >= 0.5)),
+        "raw_mean_pairwise_l1": float(mean_pairwise_l1_distance(raw)),
+        "rounded_mean": float(np.mean(rounded)),
+        "rounded_row_sum_mean": float(np.mean(rounded_row_sums)),
+        "rounded_row_sum_std": float(np.std(rounded_row_sums)),
+        "rounded_all_zero_rows_fraction": float(np.mean(rounded_row_sums == 0)),
+        "rounded_polymorphic_snp_fraction": rounded_polymorphic_fraction(rounded),
+        "rounded_mean_pairwise_l1": float(mean_pairwise_l1_distance(rounded)),
+        "real_mean": float(np.mean(real)),
+        "real_polymorphic_snp_fraction": rounded_polymorphic_fraction(real),
+        "real_mean_pairwise_l1": float(mean_pairwise_l1_distance(real)),
+    }
+
+    output_path = Path(output_dir) / f"{model.model_name}_generation_diagnostics.json"
+    save_metrics(diagnostics, output_path)
+    print(f"Saved generation diagnostics: {output_path}")
+    print(f"Saved generation diagnostics CSV: {output_path.with_suffix('.csv')}")
+    return {
+        "generation_diagnostics_json": output_path,
+        "generation_diagnostics_csv": output_path.with_suffix(".csv"),
+        "generation_diagnostics": diagnostics,
+    }
+
+
+def save_restore_diagnostics(model, output_dir):
+    diagnostics = getattr(model, "restore_diagnostics", None)
+    if diagnostics is None:
+        return None
+
+    output_path = Path(output_dir) / f"{model.model_name}_restore_diagnostics.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, indent=2)
+
+    summary = {
+        key: value
+        for key, value in diagnostics.items()
+        if key
+        not in (
+            "checkpoint_variable_examples",
+            "generator_variable_stats",
+        )
+    }
+    pd.DataFrame([summary]).to_csv(output_path.with_suffix(".csv"), index=False)
+    print(f"Saved restore diagnostics: {output_path}")
+    print(f"Saved restore diagnostics CSV: {output_path.with_suffix('.csv')}")
+    return {
+        "restore_diagnostics_json": output_path,
+        "restore_diagnostics_csv": output_path.with_suffix(".csv"),
+        "restore_diagnostics": diagnostics,
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Save allele-frequency and PCA quality plots for a genome generator."
@@ -314,6 +419,13 @@ def evaluate_model_quality(
     real = np.asarray(real, dtype=np.float32)
     synth = model.generate(n=len(real)).astype(np.float32, copy=False)
     prefix = model.model_name
+    generation_diagnostics = save_generation_diagnostics(
+        model,
+        real,
+        output_dir,
+        n_samples=len(real),
+    )
+    restore_diagnostics = save_restore_diagnostics(model, output_dir)
 
     if synth.shape[1] != real.shape[1]:
         min_width = min(synth.shape[1], real.shape[1])
@@ -391,7 +503,7 @@ def evaluate_model_quality(
     print(f"Saved PCA (2 components) embedding: {pca_csv_path}")
     print(f"Saved quality metrics: {metrics_path}")
     print(f"Saved quality metrics CSV: {metrics_path.with_suffix('.csv')}")
-    return {
+    result = {
         "allele_frequency_plot": allele_plot_path,
         "pca2_plot": pca_plot_path,
         "pca2_embedding": pca_csv_path,
@@ -403,6 +515,11 @@ def evaluate_model_quality(
             if not isinstance(value, np.ndarray)
         },
     }
+    if generation_diagnostics is not None:
+        result.update(generation_diagnostics)
+    if restore_diagnostics is not None:
+        result.update(restore_diagnostics)
+    return result
 
 
 def main():

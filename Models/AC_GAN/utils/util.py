@@ -962,6 +962,7 @@ def plot_pca_comparisons(generator: Model, epoch_number: int,
     column_mod = 2
     row = 0
     alpha_color = 0.3
+    wasserstein_metrics = {}
     for i, pop in enumerate(populations):
         pca = PCA(n_components=2)
         pca.fit(real_sequences[real_sequences['Type'] == f'Real_{pop}'].drop(['Type'], axis=1))
@@ -975,6 +976,7 @@ def plot_pca_comparisons(generator: Model, epoch_number: int,
         real_pca2_df = pd.DataFrame(real_pca2, columns=['PC1', 'PC2'])
         fake_pca2_df = pd.DataFrame(fake_pca2, columns=['PC1', 'PC2'])
         wasserstein_dist = calculate_2d_wasserstein_distance(real_pca2, fake_pca2)
+        wasserstein_metrics[f"pca_wasserstein_{pop}"] = wasserstein_dist
 
         # Plot the real and fake points in separate subplots
         axs[row, column_mod % 2].scatter(real_pca2_df['PC1'], real_pca2_df['PC2'], c=real_color, label='Real',
@@ -996,6 +998,13 @@ def plot_pca_comparisons(generator: Model, epoch_number: int,
     real_pca2_df = pd.DataFrame(real_pca2, columns=['PC1', 'PC2'])
     fake_pca2_df = pd.DataFrame(fake_pca2, columns=['PC1', 'PC2'])
     wasserstein_dist = calculate_2d_wasserstein_distance(real_pca, fake_pca)
+    wasserstein_metrics["pca_wasserstein_distance"] = wasserstein_dist
+    population_distances = [
+        value for key, value in wasserstein_metrics.items()
+        if key.startswith("pca_wasserstein_") and key != "pca_wasserstein_distance"
+    ]
+    if population_distances:
+        wasserstein_metrics["pca_wasserstein_population_mean"] = float(np.mean(population_distances))
     # Plot the real and fake points together in another subplot
     axs[row, 1].scatter(real_pca2_df['PC1'], real_pca2_df['PC2'], c=real_color, label='Real',
                         alpha=alpha_color)
@@ -1011,17 +1020,18 @@ def plot_pca_comparisons(generator: Model, epoch_number: int,
     del real_sequences, real_pca, fake_pca, real_pca2, fake_pca2, real_pca2_df, fake_pca2_df
     gc.collect()
     print(f"Finished PCA experiment for {epoch_number}")
+    return wasserstein_metrics
 
 
 def save_models(generator: Model, discriminator: Model, acgan: Model, experiment_results_path: str, suffix: str = ""):
     discriminator.trainable = False
-    acgan.save(os.path.join(experiment_results_path, f"acgan{suffix}"))
-    acgan.save_weights(os.path.join(experiment_results_path, f"acgan{suffix}_weights"))
+    acgan.save(os.path.join(experiment_results_path, f"acgan{suffix}.keras"))
+    acgan.save_weights(os.path.join(experiment_results_path, f"acgan{suffix}.weights.h5"))
     discriminator.trainable = True
-    generator.save(os.path.join(experiment_results_path, f"generator{suffix}"))
-    generator.save_weights(os.path.join(experiment_results_path, f"generator{suffix}_weights"))
-    discriminator.save(os.path.join(experiment_results_path, f"discriminator{suffix}"))
-    discriminator.save_weights(os.path.join(experiment_results_path, f"discriminator{suffix}_weights"))
+    generator.save(os.path.join(experiment_results_path, f"generator{suffix}.keras"))
+    generator.save_weights(os.path.join(experiment_results_path, f"generator{suffix}.weights.h5"))
+    discriminator.save(os.path.join(experiment_results_path, f"discriminator{suffix}.keras"))
+    discriminator.save_weights(os.path.join(experiment_results_path, f"discriminator{suffix}.weights.h5"))
 
     # Function to calculate Euclidean distance from bottom-left corner
 

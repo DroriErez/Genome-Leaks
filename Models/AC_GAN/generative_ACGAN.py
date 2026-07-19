@@ -7,6 +7,7 @@ helpers for membership attacks.
 """
 
 import json
+import gc
 import sys
 from pathlib import Path
 
@@ -74,19 +75,34 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
         self.acgan = None
         self.checkpoint = None
         self.checkpoint_prefix = None
+        self.restore_diagnostics = None
 
         if model_path:
             self.init(model_path)
+
+    def cleanup(self) -> None:
+        """Release TensorFlow/Keras objects held by this wrapper."""
+        self.model = None
+        self.generator = None
+        self.discriminator = None
+        self.acgan = None
+        self.checkpoint = None
+        tf.keras.backend.clear_session()
+        gc.collect()
 
     def init(self, file_path: str) -> None:
         """Restore generator, discriminator, and AC-GAN from a TF checkpoint."""
         checkpoint_prefix = self._checkpoint_prefix(file_path)
         self.checkpoint_prefix = checkpoint_prefix
+        self.model_name = checkpoint_prefix.name
         model_path = Path(file_path)
 
         self._load_metadata(model_path)
         self._infer_number_of_genotypes(model_path)
-        self._infer_metadata_from_checkpoint(checkpoint_prefix)
+        # Old TensorFlow checkpoint metadata inference is intentionally disabled.
+        # New-format loading gets genotype count from the matching train CSV and
+        # class count from class_id_map.json.
+        # self._infer_metadata_from_checkpoint(checkpoint_prefix)
 
         if self.number_of_genotypes is None:
             raise ValueError(
@@ -102,14 +118,22 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
             number_of_genotypes=self.number_of_genotypes,
             alph=self.alph,
         )
-        self.generator.compile(metrics=["accuracy"])
-
         self.discriminator = build_discriminator(
             number_of_genotypes=self.number_of_genotypes,
             num_classes=self.num_classes,
             alph=self.alph,
             d_activation=self.d_activation,
         )
+
+        initial_generator_stats = self._model_variable_stats(self.generator)
+        initial_discriminator_stats = self._model_variable_stats(self.discriminator)
+        restore_status = None
+        restore_method = self._restore_generator_weights_file(checkpoint_prefix)
+        discriminator_restore_method = self._restore_discriminator_weights_file(
+            checkpoint_prefix
+        )
+
+        self.generator.compile(metrics=["accuracy"])
         self.discriminator.compile(
             optimizer=RMSprop(learning_rate=self.d_learn),
             loss=[self.validation_loss_function, self._class_loss()],
@@ -126,12 +150,50 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
             metrics=["binary_accuracy", "categorical_accuracy"],
         )
 
-        self.checkpoint = build_checkpoint(
-            generator=self.generator,
-            discriminator=self.discriminator,
-            acgan=self.acgan,
+        if self._count_changed_variables(initial_generator_stats, self.generator) == 0:
+            # Keras model-file loading is disabled in the active path because
+            # .keras files can be version-sensitive across Keras releases.
+            # restore_method = self._restore_generator_model_file(checkpoint_prefix)
+            pass
+        if self._count_changed_variables(initial_discriminator_stats, self.discriminator) == 0:
+            # discriminator_restore_method = self._restore_discriminator_model_file(
+            #     checkpoint_prefix
+            # )
+            pass
+        if self._count_changed_variables(initial_generator_stats, self.generator) == 0:
+            raise ValueError(
+                "Could not load AC-GAN generator from a .weights.h5 "
+                f"file for {checkpoint_prefix}"
+            )
+        if self._count_changed_variables(initial_discriminator_stats, self.discriminator) == 0:
+            raise ValueError(
+                "Could not load AC-GAN discriminator from a .weights.h5 "
+                f"file for {checkpoint_prefix}"
+            )
+        # Old TensorFlow .index/.data checkpoint loading is intentionally disabled.
+        # New AC-GAN runs should provide explicit component weight files:
+        #   AC_GAN_model_<epoch>_generator.weights.h5
+        #   AC_GAN_model_<epoch>_discriminator.weights.h5
+        # self.checkpoint = build_checkpoint(
+        #     generator=self.generator,
+        #     discriminator=self.discriminator,
+        #     acgan=self.acgan,
+        # )
+        # restore_status = self.checkpoint.restore(str(checkpoint_prefix))
+        # restore_status.expect_partial()
+        # restore_method = "checkpoint"
+        # restore_method = self._restore_generator_from_checkpoint_variables(checkpoint_prefix)
+        # discriminator_restore_method = self._restore_discriminator_from_checkpoint_variables(
+        #     checkpoint_prefix
+        # )
+        self.restore_diagnostics = self._build_restore_diagnostics(
+            checkpoint_prefix=checkpoint_prefix,
+            restore_status=restore_status,
+            initial_generator_stats=initial_generator_stats,
+            initial_discriminator_stats=initial_discriminator_stats,
+            restore_method=restore_method,
+            discriminator_restore_method=discriminator_restore_method,
         )
-        self.checkpoint.restore(str(checkpoint_prefix)).expect_partial()
         self.model = self.generator
 
     @staticmethod
@@ -139,6 +201,14 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
         path = Path(file_path)
         if path.suffix == ".index":
             return path.with_suffix("")
+        if path.name.endswith("_generator.weights.h5"):
+            return path.with_name(path.name[:-len("_generator.weights.h5")])
+        if path.name.endswith("_discriminator.weights.h5"):
+            return path.with_name(path.name[:-len("_discriminator.weights.h5")])
+        if path.suffix == ".keras" and path.stem.endswith("_generator"):
+            return path.with_name(path.stem[:-len("_generator")])
+        if path.suffix == ".keras" and path.stem.endswith("_discriminator"):
+            return path.with_name(path.stem[:-len("_discriminator")])
         return path
 
     def _class_loss(self):
@@ -147,6 +217,288 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
         if self.class_loss_function == "polyloss_ce":
             return polyloss_ce
         return self.class_loss_function
+
+    @staticmethod
+    def _model_variable_stats(model):
+        stats = []
+        for variable in model.weights:
+            values = tf.cast(variable, tf.float32)
+            stats.append(
+                {
+                    "name": variable.name,
+                    "shape": tuple(int(dim) for dim in variable.shape),
+                    "mean": float(tf.reduce_mean(values).numpy()),
+                    "std": float(tf.math.reduce_std(values).numpy()),
+                }
+            )
+        return stats
+
+    @classmethod
+    def _count_changed_variables(cls, initial_stats, model):
+        current_stats = cls._model_variable_stats(model)
+        return sum(
+            1
+            for before, after in zip(initial_stats, current_stats)
+            if (
+                before["shape"] == after["shape"]
+                and (
+                    not np.isclose(before["mean"], after["mean"])
+                    or not np.isclose(before["std"], after["std"])
+                )
+            )
+        )
+
+    @staticmethod
+    def _weights_file_exists(weights_prefix: Path) -> bool:
+        return (
+            weights_prefix.exists()
+            or weights_prefix.with_suffix(".index").exists()
+            or weights_prefix.with_suffix(".weights.h5").exists()
+        )
+
+    def _restore_generator_model_file(self, checkpoint_prefix: Path) -> str:
+        """Load a standalone Keras generator model when training saved one."""
+        model_candidates = [
+            checkpoint_prefix.parent / f"{checkpoint_prefix.name}_generator.keras",
+        ]
+        if checkpoint_prefix.parent.name == "checkpoints":
+            model_candidates.append(
+                checkpoint_prefix.parent.parent / "generator_last_model.keras"
+            )
+
+        for model_path in model_candidates:
+            if not model_path.exists():
+                continue
+            try:
+                self.generator = tf.keras.models.load_model(
+                    str(model_path),
+                    compile=False,
+                )
+                return f"generator_load_model:{model_path}"
+            except Exception as exc:
+                print(f"Could not load generator model from {model_path}: {exc}")
+        return "keras_generator_model_not_found"
+
+    def _restore_discriminator_model_file(self, checkpoint_prefix: Path) -> str:
+        """Load a standalone Keras discriminator model when training saved one."""
+        model_candidates = [
+            checkpoint_prefix.parent / f"{checkpoint_prefix.name}_discriminator.keras",
+        ]
+        if checkpoint_prefix.parent.name == "checkpoints":
+            model_candidates.append(
+                checkpoint_prefix.parent.parent / "discriminator_last_model.keras"
+            )
+
+        for model_path in model_candidates:
+            if not model_path.exists():
+                continue
+            try:
+                self.discriminator = tf.keras.models.load_model(
+                    str(model_path),
+                    compile=False,
+                )
+                return f"discriminator_load_model:{model_path}"
+            except Exception as exc:
+                print(f"Could not load discriminator model from {model_path}: {exc}")
+        return "keras_discriminator_model_not_found"
+
+    def _restore_generator_weights_file(self, checkpoint_prefix: Path) -> str:
+        """Load per-epoch generator weights when training saved them separately."""
+        weights_candidates = [
+            checkpoint_prefix.parent / f"{checkpoint_prefix.name}_generator_weights",
+            checkpoint_prefix.parent / f"{checkpoint_prefix.name}_generator.weights.h5",
+        ]
+        if checkpoint_prefix.parent.name == "checkpoints":
+            weights_candidates.extend(
+                [
+                    checkpoint_prefix.parent.parent / "generator_last_model_weights",
+                    checkpoint_prefix.parent.parent / "generator_last_model.weights.h5",
+                ]
+            )
+
+        for weights_path in weights_candidates:
+            if not self._weights_file_exists(weights_path):
+                continue
+            try:
+                self.generator.load_weights(str(weights_path))
+                return f"generator_load_weights:{weights_path}"
+            except Exception as exc:
+                print(f"Could not load generator weights from {weights_path}: {exc}")
+        return "checkpoint_no_generator_match"
+
+    def _restore_discriminator_weights_file(self, checkpoint_prefix: Path) -> str:
+        """Load per-epoch discriminator weights when training saved them separately."""
+        weights_candidates = [
+            checkpoint_prefix.parent / f"{checkpoint_prefix.name}_discriminator_weights",
+            checkpoint_prefix.parent / f"{checkpoint_prefix.name}_discriminator.weights.h5",
+        ]
+        if checkpoint_prefix.parent.name == "checkpoints":
+            weights_candidates.extend(
+                [
+                    checkpoint_prefix.parent.parent / "discriminator_last_model_weights",
+                    checkpoint_prefix.parent.parent / "discriminator_last_model.weights.h5",
+                ]
+            )
+
+        for weights_path in weights_candidates:
+            if not self._weights_file_exists(weights_path):
+                continue
+            try:
+                self.discriminator.load_weights(str(weights_path))
+                return f"discriminator_load_weights:{weights_path}"
+            except Exception as exc:
+                print(f"Could not load discriminator weights from {weights_path}: {exc}")
+        return "checkpoint_no_discriminator_match"
+
+    def _restore_generator_from_checkpoint_variables(self, checkpoint_prefix: Path) -> str:
+        """Fallback for old AC-GAN checkpoints that saved generator weights via acgan."""
+        checkpoint_variables = dict(tf.train.list_variables(str(checkpoint_prefix)))
+        prefix_candidates = (
+            "generator/layer_with_weights-0",
+            "acgan/layer_with_weights-0",
+        )
+        assigned_variables = 0
+
+        for prefix in prefix_candidates:
+            candidate_names = []
+            for layer_index in range(len(self.generator.weights) // 2):
+                for variable_name in ("kernel", "bias"):
+                    checkpoint_name = (
+                        f"{prefix}/layer_with_weights-{layer_index}/"
+                        f"{variable_name}/.ATTRIBUTES/VARIABLE_VALUE"
+                    )
+                    candidate_names.append(checkpoint_name)
+
+            if not all(name in checkpoint_variables for name in candidate_names):
+                continue
+
+            for variable, checkpoint_name in zip(self.generator.weights, candidate_names):
+                checkpoint_value = tf.train.load_variable(
+                    str(checkpoint_prefix),
+                    checkpoint_name,
+                )
+                if tuple(variable.shape.as_list()) != tuple(checkpoint_value.shape):
+                    raise ValueError(
+                        "Checkpoint generator variable shape mismatch for "
+                        f"{checkpoint_name}: checkpoint={checkpoint_value.shape}, "
+                        f"model={variable.shape.as_list()}"
+                    )
+                variable.assign(checkpoint_value)
+                assigned_variables += 1
+
+            return f"manual_checkpoint_variables:{prefix}:{assigned_variables}"
+
+        return "manual_checkpoint_variables:no_match"
+
+    def _restore_discriminator_from_checkpoint_variables(self, checkpoint_prefix: Path) -> str:
+        """Fallback for old AC-GAN checkpoints that need manual discriminator assignment."""
+        checkpoint_variables = dict(tf.train.list_variables(str(checkpoint_prefix)))
+        prefix_candidates = (
+            "discriminator",
+            "acgan/layer_with_weights-1",
+        )
+
+        for prefix in prefix_candidates:
+            candidate_names = []
+            for layer_index in range(3):
+                for variable_name in ("kernel", "bias"):
+                    candidate_names.append(
+                        f"{prefix}/layer_with_weights-0/"
+                        f"layer_with_weights-{layer_index}/"
+                        f"{variable_name}/.ATTRIBUTES/VARIABLE_VALUE"
+                    )
+            for layer_index in (1, 2):
+                for variable_name in ("kernel", "bias"):
+                    candidate_names.append(
+                        f"{prefix}/layer_with_weights-{layer_index}/"
+                        f"{variable_name}/.ATTRIBUTES/VARIABLE_VALUE"
+                    )
+
+            if not all(name in checkpoint_variables for name in candidate_names):
+                continue
+
+            assigned_variables = 0
+            for variable, checkpoint_name in zip(
+                self.discriminator.weights,
+                candidate_names,
+            ):
+                checkpoint_value = tf.train.load_variable(
+                    str(checkpoint_prefix),
+                    checkpoint_name,
+                )
+                if tuple(variable.shape.as_list()) != tuple(checkpoint_value.shape):
+                    raise ValueError(
+                        "Checkpoint discriminator variable shape mismatch for "
+                        f"{checkpoint_name}: checkpoint={checkpoint_value.shape}, "
+                        f"model={variable.shape.as_list()}"
+                    )
+                variable.assign(checkpoint_value)
+                assigned_variables += 1
+
+            return f"manual_checkpoint_variables:{prefix}:{assigned_variables}"
+
+        return "manual_checkpoint_variables:no_match"
+
+    @staticmethod
+    def _restore_assertion_status(restore_status):
+        if restore_status is None:
+            return {
+                "assert_existing_objects_matched": "not_run_component_weights_loaded",
+                "assert_consumed": "not_run_component_weights_loaded",
+            }
+        diagnostics = {}
+        for assertion_name in (
+            "assert_existing_objects_matched",
+            "assert_consumed",
+        ):
+            try:
+                getattr(restore_status, assertion_name)()
+                diagnostics[assertion_name] = "ok"
+            except AssertionError as exc:
+                diagnostics[assertion_name] = str(exc)
+        return diagnostics
+
+    def _build_restore_diagnostics(
+        self,
+        checkpoint_prefix,
+        restore_status,
+        initial_generator_stats,
+        initial_discriminator_stats,
+        restore_method,
+        discriminator_restore_method,
+    ):
+        checkpoint_variables = []
+        # Old TensorFlow .index/.data diagnostics are disabled for Keras-only
+        # AC-GAN loading. Keep this field empty unless a legacy checkpoint exists.
+        # checkpoint_variables = tf.train.list_variables(str(checkpoint_prefix))
+        generator_stats = self._model_variable_stats(self.generator)
+        discriminator_stats = self._model_variable_stats(self.discriminator)
+        changed_generator_variables = self._count_changed_variables(
+            initial_generator_stats,
+            self.generator,
+        )
+        changed_discriminator_variables = self._count_changed_variables(
+            initial_discriminator_stats,
+            self.discriminator,
+        )
+        diagnostics = {
+            "checkpoint_prefix": str(checkpoint_prefix),
+            "generator_restore_method": restore_method,
+            "discriminator_restore_method": discriminator_restore_method,
+            "checkpoint_variable_count": len(checkpoint_variables),
+            "checkpoint_variable_examples": [
+                {"name": name, "shape": shape}
+                for name, shape in checkpoint_variables[:20]
+            ],
+            "generator_variable_count": len(generator_stats),
+            "generator_variables_changed_after_restore": changed_generator_variables,
+            "generator_variable_stats": generator_stats,
+            "discriminator_variable_count": len(discriminator_stats),
+            "discriminator_variables_changed_after_restore": changed_discriminator_variables,
+            "discriminator_variable_stats": discriminator_stats,
+            **self._restore_assertion_status(restore_status),
+        }
+        return diagnostics
 
     def _load_metadata(self, model_path: Path) -> None:
         class_map_path = model_path.parent / "class_id_map.json"
@@ -163,13 +515,24 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
         if self.number_of_genotypes is not None:
             return
 
-        dataset_path = model_path.parent / f"{model_path.stem}_train.csv"
+        dataset_path = model_path.parent / f"{self._model_base(model_path)}_train.csv"
         if not dataset_path.exists():
             return
 
         first_row = pd.read_csv(dataset_path, nrows=1)
         genotype_columns = self._genotype_columns(first_row)
         self.number_of_genotypes = len(genotype_columns)
+
+    @staticmethod
+    def _model_base(path: Path) -> str:
+        stem = path.stem
+        if stem.endswith(".weights"):
+            stem = stem[:-len(".weights")]
+        if stem.endswith("_generator"):
+            return stem[:-len("_generator")]
+        if stem.endswith("_discriminator"):
+            return stem[:-len("_discriminator")]
+        return stem
 
     def get_attack_dataset_paths(self, models_folder: str, base: str) -> dict:
         """Return AC-GAN attack datasets using the checkpoint basename."""
@@ -256,7 +619,10 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
         if self.number_of_genotypes is not None and self.num_classes is not None:
             return
 
-        variables = tf.train.list_variables(str(checkpoint_prefix))
+        try:
+            variables = tf.train.list_variables(str(checkpoint_prefix))
+        except tf.errors.NotFoundError:
+            return
 
         if self.number_of_genotypes is None:
             one_dimensional_shapes = [
@@ -283,13 +649,21 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
             raise ValueError("class_ids length must match n")
         return tf.one_hot(class_ids, depth=self.num_classes)
 
-    def _generate_batch(self, n: int, class_ids=None) -> np.ndarray:
-        latent_samples = np.random.normal(loc=0, scale=1, size=(n, self.latent_size))
-        labels = self._label_batch(n, class_ids=class_ids)
-        generated = self.generator.predict([latent_samples, labels], verbose=0)
+    @staticmethod
+    def _postprocess_generated(generated: np.ndarray) -> np.ndarray:
+        generated = np.asarray(generated).copy()
         generated[generated < 0] = 0
         generated = np.rint(generated)
         return generated.astype(np.int8, copy=False)
+
+    def _generate_raw_batch(self, n: int, class_ids=None) -> np.ndarray:
+        latent_samples = np.random.normal(loc=0, scale=1, size=(n, self.latent_size))
+        labels = self._label_batch(n, class_ids=class_ids)
+        return self.generator.predict([latent_samples, labels], verbose=0)
+
+    def _generate_batch(self, n: int, class_ids=None) -> np.ndarray:
+        generated = self._generate_raw_batch(n, class_ids=class_ids)
+        return self._postprocess_generated(generated)
 
     def generate(self, n: int, class_ids=None) -> np.ndarray:
         """Generate n synthetic genomes."""
@@ -309,6 +683,28 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
                 ]
             generated_batches.append(
                 self._generate_batch(current_batch_size, batch_class_ids)
+            )
+            generated_so_far += current_batch_size
+        return np.vstack(generated_batches)
+
+    def generate_raw(self, n: int, class_ids=None) -> np.ndarray:
+        """Generate raw continuous AC-GAN outputs before clipping/rounding."""
+        if self.generator is None:
+            raise ValueError("Model not loaded. Call init() first.")
+        if n < 1:
+            raise ValueError("n must be at least 1")
+
+        generated_batches = []
+        generated_so_far = 0
+        while generated_so_far < n:
+            current_batch_size = min(self.generation_batch_size, n - generated_so_far)
+            batch_class_ids = None
+            if class_ids is not None:
+                batch_class_ids = class_ids[
+                    generated_so_far:generated_so_far + current_batch_size
+                ]
+            generated_batches.append(
+                self._generate_raw_batch(current_batch_size, batch_class_ids)
             )
             generated_so_far += current_batch_size
         return np.vstack(generated_batches)

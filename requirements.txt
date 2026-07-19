@@ -7,3 +7,6 @@ numba>=0.57
 torch>=2.0
 pandas>=2.0,<3
 tables>=3.9.0
+PyYAML
+tensorflow[and-cuda]
+seaborn

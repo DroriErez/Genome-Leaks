@@ -1,3 +1,4 @@
+import gc
 import os
 import re
 import sys
@@ -60,8 +61,8 @@ results_folder = "attacks/results"
 
 # Development filter. Set to None to attack every checkpoint in models_folder.
 # Examples:
-# MODEL_NAME_REGEX = r"^AC_GAN_model_\d+\.index$"
-MODEL_NAME_REGEX = r"^(WGAN|VAE)_model_\d+\.pth$"
+MODEL_NAME_REGEX = r"^AC_GAN_model_\d+_generator\.weights\.h5$"
+# MODEL_NAME_REGEX = r"^(WGAN|VAE)_model_\d+\.pth$"
 # MODEL_NAME_REGEX = r"^WGAN_model_(0|10000)\.pth$"
 # MODEL_NAME_REGEX = r"^(WGAN_model_(1000|10000)|VAE_model_10000)\.pth$"
 # MODEL_NAME_REGEX = r"^WGAN_model_\d+\.pth$"
@@ -108,7 +109,7 @@ def get_model_files(models_dir, model_name_regex=None):
     model_files = sorted(
         (
             path
-            for pattern in ("*.pth", "*.index")
+            for pattern in ("*.pth", "*.index", "*.keras", "*.weights.h5")
             for path in models_path.glob(pattern)
             if path.is_file()
         ),
@@ -119,7 +120,29 @@ def get_model_files(models_dir, model_name_regex=None):
         return model_files
 
     pattern = re.compile(model_name_regex)
-    return [path for path in model_files if pattern.search(path.name)]
+    selected_files = [path for path in model_files if pattern.search(path.name)]
+    selected_by_base = {}
+    for path in selected_files:
+        base = model_checkpoint_base(path)
+        existing = selected_by_base.get(base)
+        if existing is None or (
+            path.name.endswith("_generator.keras")
+            and not existing.name.endswith("_generator.keras")
+        ):
+            selected_by_base[base] = path
+    return [selected_by_base[base] for base in sorted(selected_by_base)]
+
+
+def model_checkpoint_base(model_file):
+    """Return the shared checkpoint stem for index and Keras component files."""
+    stem = Path(model_file).stem
+    if stem.endswith(".weights"):
+        stem = stem[:-len(".weights")]
+    if stem.endswith("_generator"):
+        return stem[:-len("_generator")]
+    if stem.endswith("_discriminator"):
+        return stem[:-len("_discriminator")]
+    return stem
 
 
 def save_attack_results(model_name, attack_results, output_dir):
@@ -231,10 +254,11 @@ def create_run_output_dir(base_output_dir):
     """Create a unique timestamped directory for this script run."""
     base_output_dir = Path(base_output_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = base_output_dir / timestamp
+    run_folder_name = f"run_{timestamp}"
+    output_dir = base_output_dir / run_folder_name
     suffix = 2
     while output_dir.exists():
-        output_dir = base_output_dir / f"{timestamp}_{suffix:02d}"
+        output_dir = base_output_dir / f"{run_folder_name}_{suffix:02d}"
         suffix += 1
     output_dir.mkdir(parents=True)
     return output_dir
@@ -652,11 +676,11 @@ def run_attacks(
         # ),
         CriticScoreAttack(n_repeats=1, batch_size=16, pack_mode="repeat_candidate"),
         ReconstructionLossAttack(),
-        # DiscriminatorScoreAttack(discriminator_weight=1.0, class_confidence_weight=0.0, batch_size=8),
-        # DiscriminatorScoreAttack(discriminator_weight=0.0, class_confidence_weight=1.0, batch_size=8, class_confidence_mode="predicted_class"),
-        # DiscriminatorScoreAttack(discriminator_weight=0.5, class_confidence_weight=0.5, batch_size=8, class_confidence_mode="predicted_class"),
-        # DiscriminatorScoreAttack(discriminator_weight=0.0, class_confidence_weight=1.0, batch_size=8, class_confidence_mode="true_class"),
-        # DiscriminatorScoreAttack(discriminator_weight=0.5, class_confidence_weight=0.5, batch_size=8, class_confidence_mode="true_class"),
+        DiscriminatorScoreAttack(discriminator_weight=1.0, class_confidence_weight=0.0, batch_size=8),
+        DiscriminatorScoreAttack(discriminator_weight=0.0, class_confidence_weight=1.0, batch_size=8, class_confidence_mode="predicted_class"),
+        DiscriminatorScoreAttack(discriminator_weight=0.5, class_confidence_weight=0.5, batch_size=8, class_confidence_mode="predicted_class"),
+        DiscriminatorScoreAttack(discriminator_weight=0.0, class_confidence_weight=1.0, batch_size=8, class_confidence_mode="true_class"),
+        DiscriminatorScoreAttack(discriminator_weight=0.5, class_confidence_weight=0.5, batch_size=8, class_confidence_mode="true_class"),
     ]  # Attack instances
 
     attack_thresholds = {
@@ -1029,7 +1053,7 @@ for model_file in model_files:
         print(f"Using model generation batch size: {model.generation_batch_size}")
     print(f"Using wrapper model architecture: {model.get_model_architecture()}")
 
-    base = model_file.stem
+    base = model_checkpoint_base(model_file)
     attack_dataset_paths = model.get_attack_dataset_paths(models_folder, base)
     train_path = attack_dataset_paths["train"]
     eval_path = attack_dataset_paths["eval"]
@@ -1079,5 +1103,12 @@ for model_file in model_files:
     metric_paths = save_attack_results(model.model_name, attack_results, run_output_dir)
     for metric_path in metric_paths:
         print(f"Saved metrics log: {metric_path}")
+
+    if hasattr(model, "cleanup"):
+        model.cleanup()
+    del model, attack_results, quality_metrics
+    if "quality_results" in locals():
+        del quality_results
+    gc.collect()
 
 print("\nAll models processed successfully!")
