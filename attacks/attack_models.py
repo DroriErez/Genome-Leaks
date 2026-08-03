@@ -21,6 +21,7 @@ PLOT_CALLOUT_FONT_SIZE = 20
 PLOT_FIG_SIZE = (6.5, 5.7)
 RUN_SUMMARY_COLUMNS = [
     "Model name",
+    "Epoch",
     "Model type",
     "Attack type",
     "Attack",
@@ -34,7 +35,7 @@ RUN_SUMMARY_COLUMNS = [
     "Privacy loss",
     "AF_MAE",
     "AF_Pearson",
-    "W distance",
+    "PCA2 W distance",
     "real_vs_synth_AUC",
 ]
 
@@ -145,6 +146,12 @@ def model_checkpoint_base(model_file):
     return stem
 
 
+def numeric_model_epoch(model_name):
+    """Return the numeric checkpoint epoch, or an empty value if unavailable."""
+    epoch = GenomeGenerativeModelWrapper.infer_model_epochs(model_name)
+    return int(epoch) if str(epoch).isdigit() else ""
+
+
 def save_attack_results(model_name, attack_results, output_dir):
     """Save one aggregated metrics CSV per model and one metrics CSV per attack."""
     out_paths = []
@@ -154,6 +161,7 @@ def save_attack_results(model_name, attack_results, output_dir):
         attack_display_name = data.get("display_name", attack_name)
         summary_data = {
             "model": model_name,
+            "epoch": numeric_model_epoch(model_name),
             "attack": attack_name,
             "attack_display_name": attack_display_name,
             "tp": attack_metrics["tp"],
@@ -223,6 +231,7 @@ def build_run_summary_rows(model_name, attack_results, quality_metrics=None, mod
         rows.append(
             {
                 "Model name": model_name,
+                "Epoch": numeric_model_epoch(model_name),
                 "Model type": model_type,
                 "Attack type": attack_name,
                 "Attack": attack_display_name,
@@ -240,7 +249,7 @@ def build_run_summary_rows(model_name, attack_results, quality_metrics=None, mod
                 "Privacy loss": attack_metrics["privacy_loss"],
                 "AF_MAE": quality_metrics.get("allele_frequency_mae", np.nan),
                 "AF_Pearson": quality_metrics.get("allele_frequency_pearson", np.nan),
-                "W distance": quality_metrics.get("pca_wasserstein_distance", np.nan),
+                "PCA2 W distance": quality_metrics.get("pca_wasserstein_distance", np.nan),
                 "real_vs_synth_AUC": quality_metrics.get(
                     "real_vs_synthetic_classifier_auc",
                     np.nan,
@@ -301,6 +310,8 @@ def save_attack_predictions(
     """Save attack predictions and scores to CSV."""
     out_path = Path(output_dir) / f"{model_name}_{attack_name}_predictions.csv"
     prediction_data = {
+        "model": np.repeat(model_name, len(true_labels)),
+        "epoch": np.repeat(numeric_model_epoch(model_name), len(true_labels)),
         "true_label": true_labels,
         "prediction": predictions,
         "score": scores,
