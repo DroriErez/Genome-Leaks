@@ -29,6 +29,7 @@ tmp/
 *.pth
 *.index
 *.data*
+*.h5
 
 # Jupyter
 .ipynb_checkpoints/
@@ -51,3 +52,7 @@ models/AC_GAN/analysis/data_analysis.ipynb
 .gitignore
 .gitignore
 models/AC_GAN/analysis/train_classifier_with_synthetic.ipynb
+.gitignore
+.gitignore
+
+id_rsa
