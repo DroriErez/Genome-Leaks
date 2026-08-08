@@ -9,7 +9,6 @@ This module provides:
 """
 
 import numpy as np
-from numba import njit
 from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn.functional as F
