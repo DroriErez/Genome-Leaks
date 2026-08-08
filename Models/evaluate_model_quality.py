@@ -31,11 +31,6 @@ from scipy.stats import wasserstein_distance
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from AA_Simulation.measurements import calc_AA
-from models.models_factory import create_model_wrapper
-from utils.device import get_device, get_memory_based_batch_size
-
-
 PLOT_LABEL_FONT_SIZE = 22
 PLOT_TITLE_FONT_SIZE = 20
 PLOT_LEGEND_FONT_SIZE = 20
@@ -319,6 +314,11 @@ def save_generation_diagnostics(model, real, output_dir, n_samples):
     rounded_row_sums = np.sum(rounded, axis=1)
     diagnostics = {
         "model": model.model_name,
+        "epoch": (
+            int(model.get_model_epochs())
+            if str(model.get_model_epochs()).isdigit()
+            else ""
+        ),
         "n_samples": int(n_samples),
         "n_snps": int(raw.shape[1]),
         "raw_min": float(np.min(raw)),
@@ -371,6 +371,15 @@ def save_restore_diagnostics(model, output_dir):
             "generator_variable_stats",
         )
     }
+    summary = {
+        "model": model.model_name,
+        "epoch": (
+            int(model.get_model_epochs())
+            if str(model.get_model_epochs()).isdigit()
+            else ""
+        ),
+        **summary,
+    }
     pd.DataFrame([summary]).to_csv(output_path.with_suffix(".csv"), index=False)
     print(f"Saved restore diagnostics: {output_path}")
     print(f"Saved restore diagnostics CSV: {output_path.with_suffix('.csv')}")
@@ -407,6 +416,7 @@ def evaluate_model_quality(
     aa_samples=200,
     pca_components=50,
     seed=42,
+    synthetic_data=None,
 ):
     """Generate quality plots and metrics for an already-loaded model wrapper."""
     output_dir = Path(output_dir)
@@ -417,7 +427,16 @@ def evaluate_model_quality(
     else:
         real = read_hapt(real_path, nrows=n_samples)
     real = np.asarray(real, dtype=np.float32)
-    synth = model.generate(n=len(real)).astype(np.float32, copy=False)
+    if synthetic_data is None:
+        synth = model.generate(n=len(real))
+    else:
+        if len(synthetic_data) < len(real):
+            raise ValueError(
+                f"Synthetic cache has {len(synthetic_data)} samples; "
+                f"quality evaluation requires {len(real)}"
+            )
+        synth = synthetic_data[:len(real)]
+    synth = np.asarray(synth, dtype=np.float32)
     prefix = model.model_name
     generation_diagnostics = save_generation_diagnostics(
         model,
@@ -440,6 +459,11 @@ def evaluate_model_quality(
     metrics.update(
         {
             "model": model.model_name,
+            "epoch": (
+                int(model.get_model_epochs())
+                if str(model.get_model_epochs()).isdigit()
+                else ""
+            ),
             "real_data": str(real_path),
             "n_real": int(len(real)),
             "n_synthetic": int(len(synth)),
@@ -448,16 +472,21 @@ def evaluate_model_quality(
     )
 
     aa_n = min(aa_samples, len(real), len(synth))
+    metrics["aa_n_samples"] = int(aa_n)
     if aa_n >= 2:
-        aa, real2real, real2synth, synth2synth = calc_AA(real[:aa_n], synth[:aa_n])
-        metrics.update(
-            {
-                "aa": float(aa),
-                "real_to_real_distance_mean": float(np.mean(real2real)),
-                "real_to_synth_distance_mean": float(np.mean(real2synth)),
-                "synth_to_synth_distance_mean": float(np.mean(synth2synth)),
-            }
-        )
+        try:
+            from AA_Simulation.measurements import calc_AA
+            aa, real2real, real2synth, synth2synth = calc_AA(real[:aa_n], synth[:aa_n])
+            metrics.update(
+                {
+                    "aa": float(aa),
+                    "real_to_real_distance_mean": float(np.mean(real2real)),
+                    "real_to_synth_distance_mean": float(np.mean(real2synth)),
+                    "synth_to_synth_distance_mean": float(np.mean(synth2synth)),
+                }
+            )
+        except ImportError as error:
+            metrics["aa_status"] = f"skipped: {error}"
 
     metrics["real_vs_synthetic_classifier_auc"] = real_vs_synthetic_auc(
         real,
@@ -467,6 +496,20 @@ def evaluate_model_quality(
     )
 
     title_suffix = model.get_model_title_suffix()
+    allele_csv_path = output_dir / f"{prefix}_allele_frequencies.csv"
+    pd.DataFrame(
+        {
+            "model": model.model_name,
+            "epoch": metrics["epoch"],
+            "snp_index": np.arange(len(metrics["real_af"])),
+            "real_allele_frequency": metrics["real_af"],
+            "synthetic_allele_frequency": metrics["synth_af"],
+            "frequency_difference": metrics["synth_af"] - metrics["real_af"],
+            "absolute_frequency_error": np.abs(
+                metrics["synth_af"] - metrics["real_af"]
+            ),
+        }
+    ).to_csv(allele_csv_path, index=False)
     allele_plot_path = output_dir / f"{prefix}_allele_frequency.png"
     plot_allele_frequencies(
         metrics["real_af"],
@@ -483,6 +526,14 @@ def evaluate_model_quality(
     combined = np.vstack([real_pca, synth_pca]).astype(np.float32, copy=False)
     labels = np.array(["Real"] * len(real_pca) + ["Synthetic"] * len(synth_pca))
     pca_embedding_df = pca_embedding(combined, labels, seed)
+    pca_embedding_df.insert(0, "model", model.model_name)
+    pca_embedding_df.insert(
+        1,
+        "epoch",
+        int(model.get_model_epochs())
+        if str(model.get_model_epochs()).isdigit()
+        else "",
+    )
     pca_w_distance = pca_wasserstein_distance(pca_embedding_df)
     metrics["pca_wasserstein_distance"] = pca_w_distance
     pca_plot_path = output_dir / f"{prefix}_pca2.png"
@@ -499,12 +550,14 @@ def evaluate_model_quality(
     save_metrics(metrics, metrics_path)
 
     print(f"Saved allele-frequency plot: {allele_plot_path}")
+    print(f"Saved per-SNP allele frequencies: {allele_csv_path}")
     print(f"Saved PCA (2 components) plot: {pca_plot_path}")
     print(f"Saved PCA (2 components) embedding: {pca_csv_path}")
     print(f"Saved quality metrics: {metrics_path}")
     print(f"Saved quality metrics CSV: {metrics_path.with_suffix('.csv')}")
     result = {
         "allele_frequency_plot": allele_plot_path,
+        "allele_frequencies_csv": allele_csv_path,
         "pca2_plot": pca_plot_path,
         "pca2_embedding": pca_csv_path,
         "metrics_json": metrics_path,
@@ -523,6 +576,9 @@ def evaluate_model_quality(
 
 
 def main():
+    from models.models_factory import create_model_wrapper
+    from utils.device import get_device, get_memory_based_batch_size
+
     args = parse_args()
     device = get_device() if args.device == "auto" else torch.device(args.device)
     generation_batch_size = args.generation_batch_size
