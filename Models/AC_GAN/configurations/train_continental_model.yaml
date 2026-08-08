@@ -5,10 +5,10 @@ latent_size: 800
 alph: 0.01
 g_learn: 0.0001
 d_learn: 0.0008
-epochs: 10000
+epochs: 2000
 batch_size: 64
 class_loss_weights: 1
-save_number: 1000
+save_number: 200
 synthetic_samples_number: 500
 minimum_samples: 50
 target_column: Superpopulation_code
