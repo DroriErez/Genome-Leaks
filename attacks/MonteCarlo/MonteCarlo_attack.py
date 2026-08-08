@@ -12,8 +12,6 @@ import numpy as np
 import gc
 import sys
 import os
-import re
-from pathlib import Path
 
 try:
     from scipy.spatial import distance as dist
@@ -41,9 +39,6 @@ class MonteCarlo_attack(attack):
         candidate_batch_size: int = 32,
         d_min_n_samples: Optional[int] = None,
         fit_n_samples: Optional[int] = None,
-        synthetic_cache_dir: Optional[str] = None,
-        synthetic_cache_batch_size: int = 500,
-        synthetic_cache_key: Optional[str] = None,
         distance_backend: str = "auto",
         cleanup_interval: int = 25,
     ) -> None:
@@ -60,12 +55,6 @@ class MonteCarlo_attack(attack):
             d_min_n_samples: Number of synthetic samples to use when
                 calibrating ``d_min`` during fit. Defaults to ``n_samples``.
             fit_n_samples: Backward-compatible alias for ``d_min_n_samples``.
-            synthetic_cache_dir: Directory for generated synthetic sample
-                caches. If omitted, samples are generated on the fly.
-            synthetic_cache_batch_size: Number of synthetic samples to generate
-                per cache-writing batch.
-            synthetic_cache_key: Optional stable cache name. Defaults to the
-                model wrapper name during fit.
             distance_backend: Distance implementation. ``auto`` uses torch for
                 euclidean distances when available, otherwise scipy.
             cleanup_interval: Run expensive garbage/CUDA cache cleanup every N
@@ -79,13 +68,9 @@ class MonteCarlo_attack(attack):
         if d_min_n_samples is None:
             d_min_n_samples = fit_n_samples
         self.d_min_n_samples = n_samples if d_min_n_samples is None else d_min_n_samples
-        self.synthetic_cache_dir = Path(synthetic_cache_dir) if synthetic_cache_dir is not None else None
-        self.synthetic_cache_batch_size = synthetic_cache_batch_size
-        self.synthetic_cache_key = synthetic_cache_key
         self.distance_backend = distance_backend
         self.cleanup_interval = cleanup_interval
         self.synthetic_data = None
-        self.synthetic_cache_path = None
         self.ref_distances = None
         self.mean_distance = None
         self.std_distance = None
@@ -141,11 +126,7 @@ class MonteCarlo_attack(attack):
             synthetic_data = self._as_2d(synthetic_data)
             if len(synthetic_data) < 2:
                 raise ValueError("Synthetic data must contain at least 2 samples")
-        elif self.synthetic_cache_dir is not None:
-            synthetic_data = self.get_synthetic_data(
-                wrapper,
-                expected_feature_shape=non_train_data.shape[1:],
-            )
+            self.synthetic_data = synthetic_data
 
         d_min_n_samples = self.d_min_n_samples
         if d_min_n_samples <= 0:
@@ -342,108 +323,6 @@ class MonteCarlo_attack(attack):
 
         return np.vstack(generated)
 
-    def _safe_cache_name(self, value):
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "model"
-
-    def get_synthetic_data(self, modelWrapper=None, expected_feature_shape=None):
-        wrapper = self._get_wrapper(modelWrapper)
-        if self.synthetic_data is not None:
-            return self.synthetic_data
-
-        if self.synthetic_cache_dir is None:
-            self.synthetic_data = self._generate_samples(wrapper, self.n_samples)
-            return self.synthetic_data
-
-        self.synthetic_data, self.synthetic_cache_path = self._load_or_create_synthetic_cache(
-            wrapper,
-            self.n_samples,
-            expected_feature_shape=expected_feature_shape,
-        )
-        return self.synthetic_data
-
-    def _load_or_create_synthetic_cache(
-        self,
-        wrapper,
-        n_samples,
-        expected_feature_shape=None,
-    ):
-        if n_samples < 1:
-            raise ValueError("n_samples must be at least 1")
-        if self.synthetic_cache_batch_size < 1:
-            raise ValueError("synthetic_cache_batch_size must be at least 1")
-
-        cache_dir = Path(self.synthetic_cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_key = self.synthetic_cache_key or getattr(wrapper, "model_name", "model")
-        cache_name = self._safe_cache_name(cache_key)
-        cache_path = cache_dir / f"{cache_name}_synthetic_{n_samples}.npy"
-
-        if cache_path.exists():
-            cached = np.load(cache_path, mmap_mode="r")
-            shape_matches = (
-                expected_feature_shape is None
-                or tuple(cached.shape[1:]) == tuple(expected_feature_shape)
-            )
-            if cached.shape[0] >= n_samples and shape_matches:
-                print(f"Using cached synthetic samples: {cache_path}")
-                return cached[:n_samples], cache_path
-            print(
-                f"Ignoring cached synthetic samples with shape {cached.shape}; "
-                f"expected ({n_samples}, {expected_feature_shape}). Regenerating."
-            )
-
-        temp_path = cache_path.with_suffix(".tmp.npy")
-        if temp_path.exists():
-            temp_path.unlink()
-
-        first_batch_size = min(self.synthetic_cache_batch_size, n_samples)
-        first_batch = self._as_2d(wrapper.generate(n=first_batch_size))
-        if len(first_batch) == 0:
-            raise ValueError("modelWrapper.generate(...) returned an empty batch")
-        first_batch = first_batch[:first_batch_size]
-
-        feature_shape = first_batch.shape[1:]
-        if expected_feature_shape is not None and tuple(feature_shape) != tuple(expected_feature_shape):
-            raise ValueError(
-                f"Generated synthetic samples have feature shape {feature_shape}, "
-                f"expected {expected_feature_shape}"
-            )
-
-        synthetic_memmap = np.lib.format.open_memmap(
-            temp_path,
-            mode="w+",
-            dtype=first_batch.dtype,
-            shape=(n_samples, *feature_shape),
-        )
-        synthetic_memmap[:len(first_batch)] = first_batch[:n_samples]
-        generated_so_far = len(first_batch)
-        print(f"Generated synthetic cache batch: {generated_so_far}/{n_samples}")
-
-        while generated_so_far < n_samples:
-            current_batch_size = min(
-                self.synthetic_cache_batch_size,
-                n_samples - generated_so_far,
-            )
-            batch = self._as_2d(wrapper.generate(n=current_batch_size))
-            if len(batch) == 0:
-                raise ValueError("modelWrapper.generate(...) returned an empty batch")
-            batch = batch[:current_batch_size]
-            if batch.shape[1:] != feature_shape:
-                raise ValueError(
-                    f"Generated batch feature shape {batch.shape[1:]} does not match {feature_shape}"
-                )
-
-            end = generated_so_far + len(batch)
-            synthetic_memmap[generated_so_far:end] = batch
-            generated_so_far = end
-            print(f"Generated synthetic cache batch: {generated_so_far}/{n_samples}")
-
-        synthetic_memmap.flush()
-        del synthetic_memmap
-        temp_path.replace(cache_path)
-        print(f"Saved synthetic samples cache: {cache_path}")
-        return np.load(cache_path, mmap_mode="r"), cache_path
-
     def _get_synthetic_batch(self, start, batch_size, synthetic_data):
         indices = (np.arange(batch_size) + start) % len(synthetic_data)
         return synthetic_data[indices]
@@ -526,8 +405,6 @@ class MonteCarlo_attack(attack):
         if synthetic_data is None:
             if self.synthetic_data is not None:
                 synthetic_data = self.synthetic_data
-            elif self.synthetic_cache_dir is not None:
-                synthetic_data = self.get_synthetic_data(modelWrapper)
             else:
                 wrapper = self._get_wrapper(modelWrapper)
 
