@@ -20,8 +20,9 @@ python models/PCA_DM/human/MULTI/train.py --data-path Data/1000G_real_genomes/80
 
 Each input row must have two metadata fields followed by space-separated binary
 SNP calls. PCA is fitted from the training haplotypes and saved with each run.
-Generated files use the same two-metadata-column `.hapt` format and contain only
-0/1 SNP calls.
+Generated datasets are saved as two-dimensional NumPy `.npy` arrays containing
+only 0/1 SNP calls. Their `PCA_DM_model_<epoch>_synthetic_<count>.npy` names and
+array layout allow the shared synthetic-data cache to reuse them directly.
 
 Useful options include `--pca-components`, `--epochs`, `--batch-size`,
 `--checkpoint-every`, `--generate-samples`, and `--output-dir`. Run artifacts
@@ -39,7 +40,7 @@ frequencies:
 
 - a compact FP16 inference checkpoint containing model weights and architecture
   metadata (optimizer and scheduler states are intentionally omitted);
-- generated binary haplotypes in `.hapt` format;
+- a cache-compatible generated binary haplotype matrix in `.npy` format;
 - real and synthetic allele frequencies plus a comparison plot;
 - a two-component PCA embedding CSV and plot;
 - quality metrics in JSON and CSV formats.

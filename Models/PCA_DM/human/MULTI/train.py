@@ -65,15 +65,6 @@ def reconstruct_binary(pca_scores, pca):
     return (probabilities >= 0.5).astype(np.uint8)
 
 
-def write_hapt(path, haplotypes, label="Synthetic"):
-    """Write binary haplotypes using the repository's .hapt convention."""
-    path = Path(path)
-    with path.open("w") as handle:
-        for index, row in enumerate(haplotypes):
-            calls = " ".join(row.astype(str))
-            handle.write(f"{label} PCA_DM_{index + 1} {calls}\n")
-
-
 def diffusion_loss(model, scores, batch_size, device):
     """Average DDPM noise-prediction loss without updating model weights."""
     loader = DataLoader(TensorDataset(torch.from_numpy(scores)), batch_size=batch_size)
@@ -374,9 +365,12 @@ def main():
             with torch.no_grad():
                 generated_scores = model.sample(args.generate_samples, device_dm).cpu().numpy()
             synthetic = reconstruct_binary(generated_scores, pca)
-            synthetic_path = run_dir / f"PCA_DM_model_{epoch}_output.hapt"
-            write_hapt(synthetic_path, synthetic)
-            print(f"Saved {len(synthetic)} synthetic haplotypes: {synthetic_path}")
+            synthetic_path = (
+                run_dir
+                / f"PCA_DM_model_{epoch}_synthetic_{len(synthetic)}.npy"
+            )
+            np.save(synthetic_path, synthetic)
+            print(f"Saved {len(synthetic)} cached synthetic haplotypes: {synthetic_path}")
             evaluation_loss = diffusion_loss(
                 model, evaluation_scores, args.batch_size, device_dm
             )
