@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import yaml
 
@@ -14,7 +15,12 @@ def load_yaml_to_dict(path):
 
 
 def main(path):
-    train_genome_ac_model(**load_yaml_to_dict(path))
+    configuration = load_yaml_to_dict(path)
+    print(f"Loading AC-GAN configuration: {Path(path).resolve()}")
+    print("YAML configuration values:")
+    for key, value in configuration.items():
+        print(f"  {key}: {value}")
+    train_genome_ac_model(**configuration)
 
 
 if __name__ == '__main__':

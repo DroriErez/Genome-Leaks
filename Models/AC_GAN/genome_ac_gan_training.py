@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os.path
+import sys
 from pathlib import Path
 
 import tensorflow
@@ -9,12 +10,20 @@ import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras import regularizers
 from tensorflow.keras.activations import softmax
-from tensorflow.keras.layers import Input, Dense, LeakyReLU, Dropout, BatchNormalization
+from tensorflow.keras.layers import (
+    Input, Dense, LeakyReLU, Dropout, BatchNormalization, Activation,
+)
 from tensorflow.keras.metrics import CategoricalAccuracy
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import RMSprop
 
 from utils.util import *
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from models.evaluate_model_quality import evaluate_model_quality
 
 plt.switch_backend('agg')
 
@@ -27,6 +36,48 @@ CHECKPOINTS_FOLDER = "checkpoints"
 CHECKPOINT_NAME = "AC_GAN_model"
 LAST_CHECKPOINT_NAME = f"{CHECKPOINT_NAME}_last_model"
 TRAINING_METRICS_FILE_NAME = "training_metrics.csv"
+EPOCH_LOSSES_FILE_NAME = "epoch_component_losses.csv"
+VALIDITY_OUTPUT_NAME = "validity"
+CLASS_OUTPUT_NAME = "class_label"
+
+QUALITY_N_SAMPLES = 500
+QUALITY_PCA_PLOT_SAMPLES = 500
+QUALITY_AA_SAMPLES = 200
+QUALITY_CLASSIFIER_PCA_COMPONENTS = 50
+QUALITY_RANDOM_SEED = 42
+
+
+class TrainingCheckpointModel:
+    """Minimal model metadata adapter for shared in-training quality evaluation."""
+
+    def __init__(self, epoch, generator, latent_size, num_classes):
+        self.model_name = f"AC_GAN_model_{epoch}"
+        self.epoch = int(epoch)
+        self.generator = generator
+        self.latent_size = int(latent_size)
+        self.num_classes = int(num_classes)
+
+    def get_model_epochs(self):
+        return str(self.epoch)
+
+    def get_model_title_suffix(self):
+        return f"AC-GAN, epoch {self.epoch}"
+
+    def get_model_architecture(self):
+        return "AC-GAN"
+
+    def generate_raw(self, n):
+        class_ids = np.arange(n) % self.num_classes
+        labels = tf.one_hot(class_ids, depth=self.num_classes)
+        latent_samples = np.random.normal(
+            loc=0,
+            scale=1,
+            size=(n, self.latent_size),
+        )
+        return self.generator.predict(
+            [latent_samples, labels],
+            verbose=0,
+        )
 
 
 # Make Generator Model
@@ -74,8 +125,8 @@ def build_discriminator(number_of_genotypes: int, num_classes: int, alph: float,
     features = discriminator(sequence)
 
     # Building the output layer
-    validity = Dense(1, activation=d_activation)(features)
-    label = Dense(num_classes, activation="softmax")(features)
+    validity = Dense(1, activation=d_activation, name=VALIDITY_OUTPUT_NAME)(features)
+    label = Dense(num_classes, activation="softmax", name=CLASS_OUTPUT_NAME)(features)
 
     return Model(sequence, [validity, label])
 
@@ -86,7 +137,11 @@ def build_acgan(generator, discriminator):
         if not isinstance(layer, BatchNormalization):
             layer.trainable = False
 
-    acgan_output = discriminator(generator.output)
+    discriminator_output = discriminator(generator.output)
+    acgan_output = [
+        Activation("linear", name=VALIDITY_OUTPUT_NAME)(discriminator_output[0]),
+        Activation("linear", name=CLASS_OUTPUT_NAME)(discriminator_output[1]),
+    ]
     acgan = Model(generator.input, acgan_output)
     return acgan
 
@@ -205,6 +260,7 @@ def save_checkpoints(
 def average_discriminator_score(discriminator: Model, x_values, batch_size: int = 64):
     if x_values is None or len(x_values) == 0:
         return None
+    x_values = np.asarray(x_values, dtype=np.float32)
     validity_scores, class_scores = discriminator.predict(x_values, batch_size=batch_size, verbose=0)
     average_score = float(np.average(validity_scores))
     del validity_scores, class_scores
@@ -258,6 +314,35 @@ def save_training_metrics(experiment_results_path: str, epoch: int, discriminato
     print(f"Saved training metrics: {metrics_path}")
 
 
+def save_epoch_losses(experiment_results_path: str, epoch: int, discriminator_loss: float,
+                      generator_loss: float, discriminator_validity_loss: float,
+                      discriminator_class_loss: float, generator_validity_loss: float,
+                      generator_class_loss: float):
+    """Append lightweight aggregate losses without running checkpoint evaluation."""
+    losses_path = os.path.join(experiment_results_path, EPOCH_LOSSES_FILE_NAME)
+    write_header = not os.path.exists(losses_path)
+    pd.DataFrame([{
+        "epoch": epoch,
+        "discriminator_loss": float(discriminator_loss),
+        "generator_loss": float(generator_loss),
+        "discriminator_validity_loss": float(discriminator_validity_loss),
+        "discriminator_class_loss": float(discriminator_class_loss),
+        "generator_validity_loss": float(generator_validity_loss),
+        "generator_class_loss": float(generator_class_loss),
+    }]).to_csv(losses_path, mode='a', header=write_header, index=False)
+
+
+def get_output_loss(batch_metrics: dict, output_name: str) -> float:
+    """Read a named Keras output loss and fail clearly if it is unavailable."""
+    expected_key = f"{output_name}_loss"
+    if expected_key not in batch_metrics:
+        raise KeyError(
+            f"Expected Keras metric {expected_key!r}; available metrics: "
+            f"{sorted(batch_metrics)}"
+        )
+    return float(batch_metrics[expected_key])
+
+
 def get_memory_metrics():
     metrics = {
         "cpu_rss_mb": None,
@@ -282,7 +367,8 @@ def get_memory_metrics():
 def train(batch_size: int, epochs: int, dataset: tuple, num_classes: int, latent_size: int,
           generator: Model, discriminator: Model, acgan: Model, save_number: int, class_id_to_counts: dict,
           experiment_results_path: str, id_to_class: dict, real_class_names: list, sequence_results_path: str,
-          checkpoint, checkpoints_path: str, test_dataset, synthetic_samples_number: int, start_epoch: int = 0):
+          checkpoint, checkpoints_path: str, test_dataset, synthetic_samples_number: int,
+          generator_steps: int = 1, start_epoch: int = 0):
     """
     genome-ac-gan training process
     :param batch_size: int batch size training
@@ -301,15 +387,21 @@ def train(batch_size: int, epochs: int, dataset: tuple, num_classes: int, latent
     :param sequence_results_path: path under checkpoints that will contain the synthetic sequences
     :param test_dataset: dataset to evaluate the classifier
     """
+    if generator_steps < 1:
+        raise ValueError("generator_steps must be at least 1")
     class_metric_results = None
     y_real, y_fake = np.ones([batch_size, 1]), np.zeros([batch_size, 1])
     losses = []
+    print(f"Saving per-epoch losses to: {os.path.join(experiment_results_path, EPOCH_LOSSES_FILE_NAME)}")
     train_dataset = tensorflow.data.Dataset.from_tensor_slices(dataset).shuffle(
         dataset[0].shape[0], reshuffle_each_iteration=True).batch(batch_size, drop_remainder=True)
     # Training iteration
     for e in range(start_epoch, epochs + 1):
         avg_d_loss, avg_g_loss = [], []
+        avg_d_validity_loss, avg_d_class_loss = [], []
+        avg_g_validity_loss, avg_g_class_loss = [], []
         for x_batch_real, Y_batch_real in train_dataset:
+            # Keep real SNPs in their original [0, 1] representation.
             x_batch_real_with_noise = add_noise_real_batch(x_batch_real)
             # x_batch_real_with_noise = x_batch_real - np.random.uniform(0, 0.1, size=(
             #     x_batch_real.shape[0], x_batch_real.shape[1]))
@@ -341,28 +433,55 @@ def train(batch_size: int, epochs: int, dataset: tuple, num_classes: int, latent
                                                                                 y_class_mini_batch],
                                                                  return_dict=True)
                 d_loss.append(d_loss_mini_batch["loss"])
+                avg_d_validity_loss.append(get_output_loss(d_loss_mini_batch, VALIDITY_OUTPUT_NAME))
+                avg_d_class_loss.append(get_output_loss(d_loss_mini_batch, CLASS_OUTPUT_NAME))
             discriminator.trainable = False
-            latent_samples = np.random.normal(loc=0, scale=1,
-                                              size=(batch_size, latent_size))  # create noise to be input to generator
-            fake_labels_batch = tensorflow.one_hot(
-                tensorflow.random.uniform((batch_size,), minval=0, maxval=num_classes, dtype=tensorflow.int32),
-                depth=num_classes)
-            g_loss = acgan.train_on_batch([latent_samples, fake_labels_batch],
-                                          [get_smoothing_label_batch(tf.cast(y_real, tf.float32)), fake_labels_batch],
-                                          return_dict=True)
-
             avg_d_loss.extend(d_loss)
-            avg_g_loss.append(g_loss["loss"])
-            del (x_batch_real, Y_batch_real, x_batch_real_with_noise, latent_samples, fake_labels_batch,
+            for _ in range(generator_steps):
+                latent_samples = np.random.normal(
+                    loc=0, scale=1, size=(batch_size, latent_size)
+                )
+                fake_labels_batch = tensorflow.one_hot(
+                    tensorflow.random.uniform(
+                        (batch_size,), minval=0, maxval=num_classes,
+                        dtype=tensorflow.int32,
+                    ),
+                    depth=num_classes,
+                )
+                g_loss = acgan.train_on_batch(
+                    [latent_samples, fake_labels_batch],
+                    [get_smoothing_label_batch(tf.cast(y_real, tf.float32)), fake_labels_batch],
+                    return_dict=True,
+                )
+                avg_g_loss.append(g_loss["loss"])
+                avg_g_validity_loss.append(get_output_loss(g_loss, VALIDITY_OUTPUT_NAME))
+                avg_g_class_loss.append(get_output_loss(g_loss, CLASS_OUTPUT_NAME))
+            del (x_batch_real, Y_batch_real, x_batch_real_with_noise,
+                 latent_samples, fake_labels_batch, X_batch_fake_raw,
                  X_batch_fake, x_batch_train, y_valid_batch_train, y_class_batch_train, y_batch_true,
                  discriminator_batch_train_dataset, d_loss, x_mini_batch, Y_mini_batch, y_valid_mini_batch,
                  y_class_mini_batch, d_loss_mini_batch, g_loss)
         discriminator_loss = np.average(avg_d_loss)
         generator_loss = np.average(avg_g_loss)
+        discriminator_validity_loss = np.average(avg_d_validity_loss)
+        discriminator_class_loss = np.average(avg_d_class_loss)
+        generator_validity_loss = np.average(avg_g_validity_loss)
+        generator_class_loss = np.average(avg_g_class_loss)
         losses.append((discriminator_loss, generator_loss))
 
-        print("Epoch:\t%d/%d Discriminator loss: %6.4f Generator loss: %6.4f" % (
-            e, epochs, discriminator_loss, generator_loss))
+        print(
+            "Epoch:\t%d/%d D loss: %6.4f (validity: %6.4f, class: %6.4f) "
+            "G loss: %6.4f (validity: %6.4f, class: %6.4f)" % (
+                e, epochs, discriminator_loss, discriminator_validity_loss,
+                discriminator_class_loss, generator_loss, generator_validity_loss,
+                generator_class_loss,
+            )
+        )
+        save_epoch_losses(
+            experiment_results_path, e, discriminator_loss, generator_loss,
+            discriminator_validity_loss, discriminator_class_loss,
+            generator_validity_loss, generator_class_loss,
+        )
         should_save_checkpoint = save_number == 1 or e % save_number == 0 or e == epochs
         should_save_training_metrics = should_save_checkpoint
         if should_save_checkpoint or should_save_training_metrics:
@@ -410,13 +529,53 @@ def train(batch_size: int, epochs: int, dataset: tuple, num_classes: int, latent
                                                    total_generated_samples=synthetic_samples_number,
                                                    generated_genomes_df=generated_genomes_df)
 
+                quality_real = test_dataset[0] if test_dataset is not None else dataset[0]
+                quality_synthetic = generated_genomes_df.drop(columns=["Type"]).to_numpy(
+                    dtype=np.float32
+                )
+                quality_n = min(
+                    QUALITY_N_SAMPLES,
+                    len(quality_real),
+                    len(quality_synthetic),
+                )
+                quality_results = evaluate_model_quality(
+                    model=TrainingCheckpointModel(
+                        e,
+                        generator=generator,
+                        latent_size=latent_size,
+                        num_classes=num_classes,
+                    ),
+                    real_path=(
+                        "held-out evaluation data"
+                        if test_dataset is not None
+                        else "training data"
+                    ),
+                    real_data=quality_real,
+                    synthetic_data=quality_synthetic,
+                    output_dir=Path(experiment_results_path) / "model_quality",
+                    n_samples=quality_n,
+                    pca_plot_samples=min(QUALITY_PCA_PLOT_SAMPLES, quality_n),
+                    aa_samples=min(QUALITY_AA_SAMPLES, quality_n),
+                    pca_components=QUALITY_CLASSIFIER_PCA_COMPONENTS,
+                    seed=QUALITY_RANDOM_SEED,
+                )
+                print(
+                    f"Checkpoint {e} shared quality metrics: "
+                    f"AF_MAE={quality_results['metrics']['allele_frequency_mae']:.4f}, "
+                    f"AF_Pearson={quality_results['metrics']['allele_frequency_pearson']:.4f}, "
+                    f"PCA_W={quality_results['metrics']['pca_wasserstein_distance']:.4f}, "
+                    f"real_vs_synth_AUC="
+                    f"{quality_results['metrics']['real_vs_synthetic_classifier_auc']:.4f}"
+                )
+
             if should_save_training_metrics:
                 save_training_metrics(experiment_results_path, e, discriminator_loss, generator_loss,
                                       discriminator_scores, generated_genomes_df, pca_metrics=pca_metrics)
 
             del generated_genomes_df, discriminator_scores, pca_metrics
             gc.collect()
-        del avg_d_loss, avg_g_loss
+        del (avg_d_loss, avg_g_loss, avg_d_validity_loss, avg_d_class_loss,
+             avg_g_validity_loss, avg_g_class_loss)
         gc.collect()
 
 
@@ -456,10 +615,47 @@ def train_genome_ac_model(hapt_genotypes_path: str, extra_data_path: str, experi
                           test_discriminator_classifier: bool = False,
                           test_dataset_path: str = "resource/test_AFR_pop.csv",
                           required_populations: list[str] = None,
+                          generator_steps: int = 1,
                           resume_from_checkpoint: bool = True):
     experiment_results_path = os.path.join(DEFAULT_RESULTS_FOLDER, experiment_name)
     checkpoints_path = get_checkpoints_path(experiment_results_path)
     sequence_results_path = get_checkpoint_sequences_path(checkpoints_path)
+    training_configuration = {
+        "experiment_name": experiment_name,
+        "training_data": os.path.abspath(hapt_genotypes_path),
+        "extra_data": os.path.abspath(extra_data_path),
+        "results_folder": os.path.abspath(experiment_results_path),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "save_interval": save_number,
+        "resume_from_checkpoint": resume_from_checkpoint,
+        "latent_size": latent_size,
+        "generator_learning_rate": g_learn,
+        "discriminator_learning_rate": d_learn,
+        "discriminator_to_generator_lr_ratio": d_learn / g_learn if g_learn else "undefined",
+        "generator_updates_per_outer_batch": generator_steps,
+        "discriminator_updates_per_outer_batch": 2,
+        "discriminator_to_generator_update_ratio": 2 / generator_steps,
+        "leaky_relu_alpha": alph,
+        "validity_loss": validation_loss_function,
+        "class_loss": class_loss_function,
+        "class_loss_weight": class_loss_weights,
+        "discriminator_activation": d_activation,
+        "target_column": target_column,
+        "minimum_samples_per_class": minimum_samples,
+        "required_populations": required_populations,
+        "synthetic_samples_per_checkpoint": synthetic_samples_number,
+        "use_extra_data": with_extra_data,
+        "evaluate_discriminator_classifier": test_discriminator_classifier,
+        "evaluation_data": (
+            os.path.abspath(test_dataset_path)
+            if test_discriminator_classifier else "disabled"
+        ),
+    }
+    print("\nResolved AC-GAN training configuration:")
+    for key, value in training_configuration.items():
+        print(f"  {key}: {value}")
+    print()
     Path(experiment_results_path).mkdir(parents=True, exist_ok=True)
     Path(checkpoints_path).mkdir(parents=True, exist_ok=True)
     Path(sequence_results_path).mkdir(parents=True, exist_ok=True)
@@ -538,7 +734,8 @@ def train_genome_ac_model(hapt_genotypes_path: str, extra_data_path: str, experi
           experiment_results_path=experiment_results_path, id_to_class=id_to_class, real_class_names=real_class_names,
           sequence_results_path=sequence_results_path, checkpoint=checkpoint, checkpoints_path=checkpoints_path,
           test_dataset=test_dataset,
-          synthetic_samples_number=synthetic_samples_number, start_epoch=start_epoch)
+          synthetic_samples_number=synthetic_samples_number,
+          generator_steps=generator_steps, start_epoch=start_epoch)
 
 
 def parse_args():
@@ -556,6 +753,8 @@ def parse_args():
                         help='generator learning rate')
     parser.add_argument('--d_learn', type=float, default=DEFAULT_DISCRIMINATOR_LEARNING_RATE,
                         help='discriminator learning rate')
+    parser.add_argument('--generator_steps', type=int, default=1,
+                        help='generator updates performed per outer training batch')
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='number of epochs')
     parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='initial batch size')
     parser.add_argument('--class_loss_weights', type=float, default=DEFAULT_CLASS_LOSS_WEIGHTS,
@@ -601,6 +800,7 @@ if __name__ == '__main__':
                           alph=args.alph,
                           g_learn=args.g_learn,
                           d_learn=args.d_learn,
+                          generator_steps=args.generator_steps,
                           epochs=args.epochs,
                           batch_size=args.batch_size,
                           class_loss_weights=args.class_loss_weights,
