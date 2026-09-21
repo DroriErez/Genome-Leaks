@@ -126,6 +126,31 @@ class GenomeGenerativeModelWrapper:
                 )
                 break
 
+        # Training may save a reusable dataset beside the checkpoint. Its name
+        # omits the modification-time cache suffix so it remains valid when the
+        # checkpoint and generated dataset are copied together.
+        if seed is None:
+            model_path = Path(self.file_name)
+            adjacent_pattern = re.compile(
+                rf"{re.escape(model_path.stem)}_synthetic_(\d+)\.npy"
+            )
+            adjacent = []
+            if model_path.is_file():
+                for candidate in model_path.parent.glob(
+                    f"{model_path.stem}_synthetic_*.npy"
+                ):
+                    match = adjacent_pattern.fullmatch(candidate.name)
+                    if match:
+                        adjacent.append((int(match.group(1)), candidate))
+            for _, candidate in sorted(adjacent, reverse=True):
+                seed = load_valid(candidate)
+                if seed is not None:
+                    print(
+                        "Using checkpoint synthetic dataset as generation seed: "
+                        f"available={len(seed)}, requested={n}, path={candidate}"
+                    )
+                    break
+
         temp_path = cache_path.with_suffix(".tmp.npy")
         if temp_path.exists():
             temp_path.unlink()
