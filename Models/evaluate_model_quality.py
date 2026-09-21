@@ -300,9 +300,14 @@ def save_generation_diagnostics(model, real, output_dir, n_samples):
         return None
 
     raw = np.asarray(model.generate_raw(n=len(real)), dtype=np.float32)
-    rounded = raw.copy()
-    rounded[rounded < 0] = 0
-    rounded = np.rint(rounded).astype(np.float32, copy=False)
+    # AC-GAN exposes raw tanh values. Map them differentiably to [0, 1]
+    # before applying the same 0.5 threshold used by generation.
+    if getattr(model, "get_model_architecture", lambda: "")() == "AC-GAN":
+        rounded = (((raw + 1.0) / 2.0) >= 0.5).astype(np.float32)
+    else:
+        rounded = raw.copy()
+        rounded[rounded < 0] = 0
+        rounded = np.rint(rounded).astype(np.float32, copy=False)
 
     if raw.shape[1] != real.shape[1]:
         min_width = min(raw.shape[1], real.shape[1])
@@ -399,7 +404,6 @@ def parse_args():
     parser.add_argument("--output-dir", default="attacks/results/model_quality")
     parser.add_argument("--n-samples", type=int, default=1000, help="Rows to read/generate")
     parser.add_argument("--pca-plot-samples", type=int, default=1000, help="Rows per source for PCA plot")
-    parser.add_argument("--aa-samples", type=int, default=200, help="Rows per source for AA metric")
     parser.add_argument("--pca-components", type=int, default=50)
     parser.add_argument("--generation-batch-size", type=int, default=None)
     parser.add_argument("--device", default="auto", help="Torch device: auto, cpu, cuda, cuda:0, ...")
@@ -409,20 +413,22 @@ def parse_args():
 
 def evaluate_model_quality(
     model,
-    real_path,
+    real_path=None,
     output_dir="attacks/results/model_quality",
     n_samples=1000,
     pca_plot_samples=1000,
-    aa_samples=200,
     pca_components=50,
     seed=42,
     synthetic_data=None,
+    real_data=None,
 ):
     """Generate quality plots and metrics for an already-loaded model wrapper."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if hasattr(model, "load_attack_dataset"):
+    if real_data is not None:
+        real = np.asarray(real_data, dtype=np.float32)[:n_samples]
+    elif hasattr(model, "load_attack_dataset"):
         real = model.load_attack_dataset(real_path, nrows=n_samples)
     else:
         real = read_hapt(real_path, nrows=n_samples)
@@ -464,29 +470,12 @@ def evaluate_model_quality(
                 if str(model.get_model_epochs()).isdigit()
                 else ""
             ),
-            "real_data": str(real_path),
+            "real_data": str(real_path) if real_path is not None else "in-memory",
             "n_real": int(len(real)),
             "n_synthetic": int(len(synth)),
             "n_snps": int(real.shape[1]),
         }
     )
-
-    aa_n = min(aa_samples, len(real), len(synth))
-    metrics["aa_n_samples"] = int(aa_n)
-    if aa_n >= 2:
-        try:
-            from AA_Simulation.measurements import calc_AA
-            aa, real2real, real2synth, synth2synth = calc_AA(real[:aa_n], synth[:aa_n])
-            metrics.update(
-                {
-                    "aa": float(aa),
-                    "real_to_real_distance_mean": float(np.mean(real2real)),
-                    "real_to_synth_distance_mean": float(np.mean(real2synth)),
-                    "synth_to_synth_distance_mean": float(np.mean(synth2synth)),
-                }
-            )
-        except ImportError as error:
-            metrics["aa_status"] = f"skipped: {error}"
 
     metrics["real_vs_synthetic_classifier_auc"] = real_vs_synthetic_auc(
         real,
@@ -599,7 +588,6 @@ def main():
         output_dir=args.output_dir,
         n_samples=args.n_samples,
         pca_plot_samples=args.pca_plot_samples,
-        aa_samples=args.aa_samples,
         pca_components=args.pca_components,
         seed=args.seed,
     )
