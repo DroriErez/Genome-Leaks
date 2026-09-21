@@ -545,7 +545,7 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
 
     def load_attack_dataset(self, path, nrows=None) -> np.ndarray:
         """Load an AC-GAN CSV attack dataset as a genotype matrix."""
-        df = pd.read_csv(path, nrows=nrows, low_memory=False)
+        df = pd.read_csv(path, nrows=nrows, low_memory=True)
         df = self._filter_known_labels(df, path, warn=True)
         genotype_columns = self._genotype_columns(df)
         if not genotype_columns:
@@ -651,10 +651,9 @@ class ACGAN_generative(GenomeGenerativeModelWrapper):
 
     @staticmethod
     def _postprocess_generated(generated: np.ndarray) -> np.ndarray:
-        generated = np.asarray(generated).copy()
-        generated[generated < 0] = 0
-        generated = np.rint(generated)
-        return generated.astype(np.int8, copy=False)
+        generated = np.asarray(generated)
+        generated_unit_range = (generated + 1.0) / 2.0
+        return (generated_unit_range >= 0.5).astype(np.int8, copy=False)
 
     def _generate_raw_batch(self, n: int, class_ids=None) -> np.ndarray:
         latent_samples = np.random.normal(loc=0, scale=1, size=(n, self.latent_size))
