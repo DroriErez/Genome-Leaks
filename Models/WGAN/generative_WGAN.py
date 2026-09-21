@@ -251,3 +251,12 @@ class WGAN_generative(GenomeGenerativeModelWrapper):
             generated_so_far += current_batch_size
 
         return np.vstack(generated_batches)
+
+    def cleanup(self) -> None:
+        """Release checkpoint modules and cached allocator memory between runs."""
+        self.model = None
+        self.critic = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
