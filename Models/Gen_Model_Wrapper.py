@@ -38,6 +38,10 @@ class GenomeGenerativeModelWrapper:
         """Generate fresh samples using the loaded model."""
         return self.model.generate(n)
 
+    def prepare_analysis_data(self, data):
+        """Return data unchanged; wrappers can override dataset preprocessing."""
+        return data
+
     @staticmethod
     def _safe_cache_name(value) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "model"
@@ -56,6 +60,7 @@ class GenomeGenerativeModelWrapper:
         cache_key=None,
         batch_size: int = 500,
         expected_feature_shape=None,
+        use_adjacent_seed: bool = True,
     ) -> np.ndarray:
         """Return cached synthetic samples, extending or creating the cache.
 
@@ -129,7 +134,7 @@ class GenomeGenerativeModelWrapper:
         # Training may save a reusable dataset beside the checkpoint. Its name
         # omits the modification-time cache suffix so it remains valid when the
         # checkpoint and generated dataset are copied together.
-        if seed is None:
+        if seed is None and use_adjacent_seed:
             model_path = Path(self.file_name)
             adjacent_pattern = re.compile(
                 rf"{re.escape(model_path.stem)}_synthetic_(\d+)\.npy"
