@@ -41,6 +41,12 @@ class MonteCarlo_attack(attack):
         fit_n_samples: Optional[int] = None,
         distance_backend: str = "auto",
         cleanup_interval: int = 25,
+        neighborhood: str = "epsilon",
+        score_function: str = "count",
+        k_neighbors: int = 1,
+        log_delta: float = 1e-12,
+        pca_components: int = 50,
+        min_heterozygosity: float = 0.01,
     ) -> None:
         """
         Initialize Monte Carlo Attack.
@@ -59,10 +65,27 @@ class MonteCarlo_attack(attack):
                 euclidean distances when available, otherwise scipy.
             cleanup_interval: Run expensive garbage/CUDA cache cleanup every N
                 generated batches instead of after every batch.
+            neighborhood: Select distances inside ``d_min`` (``epsilon``) or
+                the ``k`` nearest generated samples (``knn``).
+            score_function: Aggregate selected distances using ``count``,
+                ``log_distance``, or ``average_distance``. Distance-based raw
+                scores are negated so that larger always means more member-like.
+            k_neighbors: Number of nearest samples used by ``knn``.
+            log_delta: Positive numerical-stability constant added before log.
         """
         super().__init__()
         self.n_samples = n_samples
         self.distance_metric = distance_metric
+        self.allele_frequency = None
+        if distance_metric == "allele_similarity" and (
+                neighborhood != "knn" or score_function != "average_distance"):
+            raise ValueError("Allele similarity requires KNN average scoring")
+        if pca_components < 1 or min_heterozygosity <= 0:
+            raise ValueError("PCA components and minimum heterozygosity must be positive")
+        self.pca_components = pca_components
+        self.min_heterozygosity = min_heterozygosity
+        self.pca = None
+        self.feature_weights = None
         self.generation_batch_size = generation_batch_size
         self.candidate_batch_size = candidate_batch_size
         if d_min_n_samples is None:
@@ -70,6 +93,32 @@ class MonteCarlo_attack(attack):
         self.d_min_n_samples = n_samples if d_min_n_samples is None else d_min_n_samples
         self.distance_backend = distance_backend
         self.cleanup_interval = cleanup_interval
+        if neighborhood not in ("epsilon", "knn"):
+            raise ValueError("neighborhood must be 'epsilon' or 'knn'")
+        if score_function not in ("count", "log_distance", "average_distance"):
+            raise ValueError(
+                "score_function must be 'count', 'log_distance', or "
+                "'average_distance'"
+            )
+        if neighborhood == "knn" and score_function == "count":
+            raise ValueError(
+                "count scoring is constant for a fixed k; use log_distance "
+                "or average_distance with neighborhood='knn'"
+            )
+        if k_neighbors <= 0:
+            raise ValueError("k_neighbors must be positive")
+        if log_delta <= 0:
+            raise ValueError("log_delta must be positive")
+        self.neighborhood = neighborhood
+        self.score_function = score_function
+        self.k_neighbors = k_neighbors
+        self.log_delta = log_delta
+        neighborhood_name = "epsilon" if neighborhood == "epsilon" else f"knn_k{k_neighbors}"
+        self.name = f"monte_carlo_{neighborhood_name}_{score_function}"
+        if distance_metric in ("allele_similarity", "pca_euclidean", "weighted_hamming", "hamming", "jaccard", "weighted_jaccard"):
+            self.name += f"_{distance_metric}"
+        if distance_metric == "pca_euclidean" and pca_components == 2:
+            self.name += "_pca2"
         self.synthetic_data = None
         self.ref_distances = None
         self.mean_distance = None
@@ -88,8 +137,83 @@ class MonteCarlo_attack(attack):
         self.last_raw_scores = None
         self._cleanup_counter = 0
 
+    def shared_knn_signals(self, attacks, candidates, synthetic_data, modelWrapper,
+                           frequency_reference=None):
+        """Evaluate compatible KNN configurations in one bounded-memory scan.
+
+        For PCA distances, fit the full-cache PCA and project each batch once.
+        Hamming uses the original features. Snapshot each requested prefix.
+        """
+        for other in attacks:
+            if (self.distance_metric not in ("pca_euclidean", "hamming", "weighted_hamming", "allele_similarity")
+                    or other.distance_metric != self.distance_metric
+                    or other.neighborhood != "knn"
+                    or other.score_function != "average_distance"
+                    or other.pca_components != self.pca_components
+                    or other.distance_backend != self.distance_backend
+                    or other.min_heterozygosity != self.min_heterozygosity):
+                raise ValueError("Shared KNN sweep requires compatible attacks")
+            if not 0 < other.k_neighbors <= other.n_samples <= len(synthetic_data):
+                raise ValueError("Shared sweep requires k <= sample count <= cache size")
+        if self.generation_batch_size < 1 or self.candidate_batch_size < 1:
+            raise ValueError("Shared sweep batch sizes must be positive")
+        if self.distance_metric == "pca_euclidean":
+            print("Fitting shared PCA on the synthetic cache...", flush=True)
+        self.prepare(synthetic_data=synthetic_data, modelWrapper=modelWrapper,
+                     frequency_reference=frequency_reference)
+        projected_candidates = self._as_2d(candidates)
+        if self.distance_metric == "pca_euclidean":
+            projected_candidates = self.pca.transform(projected_candidates)
+        max_k = max(a.k_neighbors for a in attacks)
+        nearest = np.full((len(candidates), max_k), np.inf)
+        signals = {}
+        use_torch = self._use_torch_distances()
+        start = 0
+        for boundary in sorted({a.n_samples for a in attacks}):
+            while start < boundary:
+                end = min(start + self.generation_batch_size, boundary)
+                projected = self._as_2d(synthetic_data[start:end])
+                if self.distance_metric == "pca_euclidean":
+                    projected = self.pca.transform(projected)
+                for row in range(0, len(candidates), self.candidate_batch_size):
+                    stop = min(row + self.candidate_batch_size, len(candidates))
+                    left = projected_candidates[row:stop]
+                    if self.distance_metric in ("weighted_hamming", "allele_similarity"):
+                        distances = self._pairwise_distances(left, projected)
+                    elif use_torch:
+                        with torch.no_grad():
+                            if self.distance_metric == "hamming":
+                                distances = self._normalized_hamming_torch(left, projected).cpu().numpy()
+                            else:
+                                distances = torch.sqrt(
+                                    self._squared_euclidean_torch(left, projected)
+                                ).cpu().numpy()
+                    else:
+                        metric = "hamming" if self.distance_metric == "hamming" else "euclidean"
+                        distances = dist.cdist(left, projected, metric=metric)
+                    combined = np.concatenate([nearest[row:stop], distances], axis=1)
+                    nearest[row:stop] = np.partition(
+                        combined, max_k - 1, axis=1
+                    )[:, :max_k]
+                start = end
+            ordered = np.sort(nearest, axis=1)
+            for other in attacks:
+                if other.n_samples == boundary:
+                    signals[other.name] = -np.mean(ordered[:, :other.k_neighbors], axis=1)
+            print(f"Shared {self.distance_metric} KNN sweep: {boundary} synthetic samples evaluated", flush=True)
+        return signals
+
     def get_display_name(self) -> str:
-        return "Monte Carlo Attack"
+        neighborhood = (
+            "epsilon"
+            if self.neighborhood == "epsilon"
+            else f"{self.k_neighbors}-nearest"
+        )
+        score = self.score_function.replace("_", " ")
+        metric_label = self.distance_metric
+        if self.distance_metric == "pca_euclidean":
+            metric_label += f", {self.pca_components} components"
+        return f"Monte Carlo ({neighborhood}, {score}, {metric_label})"
 
     def fit(
         self,
@@ -97,6 +221,8 @@ class MonteCarlo_attack(attack):
         synthetic_data: Optional[np.ndarray] = None,
         thr: float = 0.5,
         modelWrapper=None,
+        training_reference=None,
+        frequency_reference=None,
     ) -> None:
         """
         Fit the attack and calibrate its decision threshold.
@@ -104,8 +230,15 @@ class MonteCarlo_attack(attack):
         ``thr`` is treated as a percentile of the non-member score
         distribution. For example, ``thr=0.95`` sets the prediction cutoff to
         the 95th percentile of scores measured on known non-training records.
+        Weighted Hamming and weighted Jaccard use these calibration records for allele frequencies
+        unless an explicit frequency_reference is supplied. training_reference
+        is retained as a legacy override for existing callers.
         """
-        self.modelWrapper = modelWrapper
+        self.prepare(
+            non_train_data, synthetic_data, modelWrapper,
+            training_reference=training_reference,
+            frequency_reference=frequency_reference,
+        )
         self.threshold = thr
         self._fit(
             non_train_data=non_train_data,
@@ -114,6 +247,90 @@ class MonteCarlo_attack(attack):
         )
         self.is_fitted = True
         return
+
+    def prepare(
+        self, non_train_data=None, synthetic_data=None, modelWrapper=None,
+        training_reference=None, frequency_reference=None,
+    ):
+        """Prepare distance features and epsilon without decision calibration.
+
+        Epsilon methods still estimate their neighborhood radius from reference
+        data. KNN methods need no radius or non-member score distribution.
+        """
+        self.is_fitted = False
+        self.score_threshold = None
+        self.raw_score_threshold = None
+        self.raw_score_threshold_0_5 = None
+        self.non_member_scores = None
+        self.non_member_raw_scores = None
+        self.sorted_non_member_raw_scores = None
+        self.last_raw_scores = None
+        self.synthetic_data = synthetic_data
+        self.modelWrapper = modelWrapper
+        if self.distance_metric == "allele_similarity":
+            reference = frequency_reference if frequency_reference is not None else non_train_data
+            if reference is None:
+                raise ValueError("Allele similarity requires a frequency reference")
+            reference = self._as_2d(reference)
+            if len(reference) == 0 or not np.all((reference == 0) | (reference == 1)):
+                raise ValueError("Allele similarity requires nonempty binary reference genomes")
+            # Clip monomorphic frequencies to keep logarithms finite.
+            self.allele_frequency = np.clip(reference.mean(axis=0, dtype=np.float64),
+                                            1e-6, 1.0 - 1e-6)
+        elif self.distance_metric in ("weighted_hamming", "weighted_jaccard"):
+            if frequency_reference is None:
+                frequency_reference = non_train_data if training_reference is None else training_reference
+            reference = self._as_2d(frequency_reference)
+            if not np.all((reference == 0) | (reference == 1)) or len(reference) == 0:
+                raise ValueError("Weighted distances require nonempty binary frequency-reference genomes")
+            frequency = np.mean(reference, axis=0, dtype=np.float64)
+            self.feature_weights = 1.0 / np.maximum(
+                2.0 * frequency * (1.0 - frequency), self.min_heterozygosity
+            )
+        elif self.distance_metric == "pca_euclidean":
+            from sklearn.decomposition import IncrementalPCA
+            if synthetic_data is None:
+                raise ValueError("PCA Euclidean requires a shared synthetic reference during fit")
+            reference = self._as_2d(synthetic_data)
+            if len(reference) < 2:
+                raise ValueError("PCA requires at least two synthetic samples")
+            n_components = min(
+                self.pca_components, len(reference) - 1, reference.shape[1]
+            )
+            # Convert only a bounded slice of the memory-mapped cache. Fitting
+            # ordinary PCA on integer genomes converts the entire cache to
+            # float64 (12.2 GiB for 100000 x 16383, before working memory).
+            pca_batch_size = max(n_components, min(self.generation_batch_size, 512))
+            self.pca = IncrementalPCA(n_components=n_components)
+            start = 0
+            while start < len(reference):
+                end = min(start + pca_batch_size, len(reference))
+                # partial_fit requires at least n_components rows. Fold a short
+                # final remainder into this batch so every sample is used once.
+                if 0 < len(reference) - end < n_components:
+                    end = len(reference)
+                batch = np.array(reference[start:end], dtype=np.float32, copy=True)
+                self.pca.partial_fit(batch)
+                del batch
+                start = end
+        if self.neighborhood == "epsilon":
+            if non_train_data is None or len(non_train_data) == 0:
+                raise ValueError("Epsilon preparation requires non-member reference data")
+            if self.d_min_n_samples <= 0:
+                raise ValueError("d_min_n_samples must be positive")
+            self.non_train_distances = self._compute_nearest_synthetic_distances(
+                self._as_2d(non_train_data), self._get_wrapper(modelWrapper),
+                synthetic_data=synthetic_data, n_samples=self.d_min_n_samples,
+            )
+            self.d_min = np.median(self.non_train_distances)
+
+    def raw_signal(self, candidates, synthetic_data=None, modelWrapper=None, **kwargs):
+        """Return uncalibrated signals, oriented so larger means more member-like."""
+        return self._raw_score(candidates, synthetic_data, modelWrapper, **kwargs)
+
+    def execute(self, candidates, **kwargs):
+        """Execute calibrated membership decisions after fit()."""
+        return self.predict(candidates, **kwargs)
 
     def _fit(self, non_train_data, synthetic_data=None, modelWrapper=None):
         wrapper = self._get_wrapper(modelWrapper)
@@ -134,14 +351,6 @@ class MonteCarlo_attack(attack):
 
         score_n_samples = len(synthetic_data) if synthetic_data is not None else self.n_samples
 
-        self.non_train_distances = self._compute_nearest_synthetic_distances(
-            non_train_data,
-            wrapper,
-            synthetic_data=synthetic_data,
-            n_samples=d_min_n_samples,
-        )
-        self.d_min = np.median(self.non_train_distances)
-
         self.non_member_raw_scores = self._raw_score(
             non_train_data,
             synthetic_data=synthetic_data,
@@ -153,10 +362,9 @@ class MonteCarlo_attack(attack):
             self.non_member_raw_scores
         )
 
-        print(
-            f"d_min calibrated with {d_min_n_samples} synthetic samples; "
-            f"non-member scores calibrated with {score_n_samples} synthetic samples"
-        )
+        if self.neighborhood == "epsilon":
+            print(f"d_min estimated with {d_min_n_samples} synthetic samples")
+        print(f"Non-member scores calibrated with {score_n_samples} synthetic samples")
         print(
             "Non-member raw score distribution: "
             f"min={np.min(self.non_member_raw_scores):.6f}, "
@@ -230,9 +438,21 @@ class MonteCarlo_attack(attack):
             return False
         if self.distance_backend not in ("auto", "torch"):
             raise ValueError("distance_backend must be 'auto', 'torch', or 'scipy'")
-        can_use = torch is not None and self.distance_metric in ("euclidean", "sqeuclidean")
+        can_use = torch is not None and self.distance_metric in (
+            "allele_similarity",
+            "euclidean",
+            "sqeuclidean",
+            "hamming",
+            "pca_euclidean",
+            "weighted_hamming",
+            "jaccard",
+            "weighted_jaccard",
+        )
         if self.distance_backend == "torch" and not can_use:
-            raise ValueError("torch distance backend currently supports only euclidean distances")
+            raise ValueError(
+                "torch distance backend currently supports euclidean, "
+                "squared-euclidean, Hamming, and Jaccard distances"
+            )
         if not can_use and dist is None:
             raise ImportError(
                 "scipy is required for non-euclidean Monte Carlo distances when torch cannot be used"
@@ -242,7 +462,13 @@ class MonteCarlo_attack(attack):
     def _as_float_tensor(self, data, device):
         if torch.is_tensor(data):
             return data.to(device=device, dtype=torch.float32, non_blocking=True)
-        return torch.as_tensor(np.asarray(data), dtype=torch.float32, device=device)
+        array = np.asarray(data)
+        if not array.flags.writeable:
+            # Synthetic caches are read-only memory maps. PyTorch warns when
+            # sharing their storage because tensor writes would be undefined.
+            # Copy only the current batch, not the full cached dataset.
+            array = array.copy()
+        return torch.as_tensor(array, dtype=torch.float32, device=device)
 
     def _squared_euclidean_torch(self, left, right, device=None):
         device = self._torch_device() if device is None else device
@@ -254,24 +480,112 @@ class MonteCarlo_attack(attack):
         distances_sq = left_norm + right_norm - 2.0 * (left_tensor @ right_tensor.T)
         return torch.clamp(distances_sq, min=0.0)
 
-    def _nearest_distances(self, left, right):
-        if self._use_torch_distances():
-            with torch.no_grad():
-                distances_sq = self._squared_euclidean_torch(left, right)
-                nearest_sq = torch.min(distances_sq, dim=1).values
-                if self.distance_metric == "euclidean":
-                    nearest = torch.sqrt(nearest_sq)
-                else:
-                    nearest = nearest_sq
-                return nearest.detach().cpu().numpy()
+    def _normalized_hamming_torch(self, left, right, device=None):
+        """Return the fraction of unequal features for every pair of rows."""
+        device = self._torch_device() if device is None else device
+        left_tensor = self._as_float_tensor(left, device)
+        right_tensor = self._as_float_tensor(right, device)
+        return torch.cdist(left_tensor, right_tensor, p=0) / left_tensor.shape[1]
 
-        distances = dist.cdist(left, right, metric=self.distance_metric)
+    def _nearest_distances(self, left, right):
+        distances = self._pairwise_distances(left, right)
         return np.min(distances, axis=1)
 
-    def _count_inside_d_min(self, left, right):
+    def _pairwise_distances(self, left, right):
+        """Return a CPU NumPy distance matrix, using torch/GPU when available."""
+        if self.distance_metric == "allele_similarity":
+            if self.allele_frequency is None:
+                raise ValueError("Prepare allele frequencies before computing similarity")
+            if not (np.all((left == 0) | (left == 1))
+                    and np.all((right == 0) | (right == 1))):
+                raise ValueError("Allele similarity requires binary genomes")
+            log_p = np.log(self.allele_frequency)
+            log_q = np.log1p(-self.allele_frequency)
+            # Return -similarity: the KNN machinery minimizes distances and
+            # negates their mean, yielding the mean of the largest similarities.
+            if self._use_torch_distances():
+                with torch.no_grad():
+                    device = self._torch_device()
+                    x = self._as_float_tensor(left, device)
+                    y = self._as_float_tensor(right, device)
+                    lp = self._as_float_tensor(log_p, device)
+                    lq = self._as_float_tensor(log_q, device)
+                    return (((x * lp) @ y.T + ((1 - x) * lq) @ (1 - y).T)
+                            / x.shape[1]).cpu().numpy()
+            x = np.asarray(left, dtype=np.float64)
+            y = np.asarray(right, dtype=np.float64)
+            return ((x * log_p) @ y.T + ((1 - x) * log_q) @ (1 - y).T) / x.shape[1]
+        if self.distance_metric in ("jaccard", "weighted_jaccard"):
+            # Binary Jaccard ignores shared absences. Two empty sets have distance 0.
+            if not (np.all((left == 0) | (left == 1))
+                    and np.all((right == 0) | (right == 1))):
+                raise ValueError("Jaccard distances require binary genomes")
+            weights = None
+            if self.distance_metric == "weighted_jaccard":
+                if self.feature_weights is None:
+                    raise ValueError("Fit allele frequencies before computing distances")
+                weights = self.feature_weights
+            if self._use_torch_distances():
+                with torch.no_grad():
+                    device = self._torch_device()
+                    x = self._as_float_tensor(left, device)
+                    y = self._as_float_tensor(right, device)
+                    w = (torch.ones(x.shape[1], device=device) if weights is None
+                         else self._as_float_tensor(weights, device))
+                    xw = x * w
+                    intersection = xw @ y.T
+                    union = xw.sum(1, keepdim=True) + (y @ w).unsqueeze(0) - intersection
+                    distances = torch.where(union > 0,
+                                            1.0 - intersection / union.clamp_min(1e-30), 0.0)
+                    return distances.clamp(0.0, 1.0).cpu().numpy()
+            return dist.cdist(left, right, metric="jaccard", **(
+                {} if weights is None else {"w": weights}
+            ))
+        if self.distance_metric == "pca_euclidean":
+            if self.pca is None:
+                raise ValueError("Fit PCA before computing distances")
+            left, right = self.pca.transform(left), self.pca.transform(right)
+        if self.distance_metric == "weighted_hamming":
+            if self.feature_weights is None:
+                raise ValueError("Fit allele frequencies before computing distances")
+            if not (np.all((left == 0) | (left == 1))
+                    and np.all((right == 0) | (right == 1))):
+                raise ValueError("Weighted Hamming requires binary genomes")
+            if self._use_torch_distances():
+                with torch.no_grad():
+                    device = self._torch_device()
+                    x = self._as_float_tensor(left, device)
+                    y = self._as_float_tensor(right, device)
+                    w = self._as_float_tensor(self.feature_weights, device)
+                    xw = x * w
+                    distances = (xw.sum(1, keepdim=True) + (y @ w).unsqueeze(0)
+                                 - 2.0 * (xw @ y.T)) / w.sum()
+                    return distances.clamp(0.0, 1.0).cpu().numpy()
+            return dist.cdist(left, right, metric="hamming", w=self.feature_weights)
         if self._use_torch_distances():
-            threshold = self.d_min * self.d_min if self.distance_metric == "euclidean" else self.d_min
             with torch.no_grad():
+                if self.distance_metric == "hamming":
+                    distances = self._normalized_hamming_torch(left, right)
+                    return distances.detach().cpu().numpy()
+                distances_sq = self._squared_euclidean_torch(left, right)
+                if self.distance_metric in ("euclidean", "pca_euclidean"):
+                    distances = torch.sqrt(distances_sq)
+                else:
+                    distances = distances_sq
+                return distances.detach().cpu().numpy()
+
+        metric = "euclidean" if self.distance_metric == "pca_euclidean" else self.distance_metric
+        return dist.cdist(left, right, metric=metric)
+
+    def _count_inside_d_min(self, left, right):
+        if self.distance_metric in ("pca_euclidean", "weighted_hamming", "jaccard", "weighted_jaccard"):
+            return np.sum(self._pairwise_distances(left, right) < self.d_min, axis=1)
+        if self._use_torch_distances():
+            with torch.no_grad():
+                if self.distance_metric == "hamming":
+                    distances = self._normalized_hamming_torch(left, right)
+                    return torch.sum(distances < self.d_min, dim=1).detach().cpu().numpy()
+                threshold = self.d_min * self.d_min if self.distance_metric == "euclidean" else self.d_min
                 distances_sq = self._squared_euclidean_torch(left, right)
                 return torch.sum(distances_sq < threshold, dim=1).detach().cpu().numpy()
 
@@ -371,16 +685,10 @@ class MonteCarlo_attack(attack):
 
     def _raw_score(self, candidates, synthetic_data=None, modelWrapper=None, **kwargs):
         """
-        Estimate raw MC-epsilon membership scores by generating samples in batches.
-
-        For each candidate x, the score is:
-            mean_j 1[d(x, g_j) < epsilon]
-
-        where g_j are generated on the fly from ``modelWrapper`` and epsilon is
-        the median nearest-synthetic distance computed during ``fit``.
+        Estimate raw membership scores using epsilon or k-nearest distances.
         """
-        if not hasattr(self, "d_min"):
-            raise ValueError("Attack must be fitted before scoring")
+        if self.neighborhood == "epsilon" and not hasattr(self, "d_min"):
+            raise ValueError("Call prepare(...) before scoring epsilon signals")
 
         n_samples = kwargs.get("n_samples", self.n_samples)
         generation_batch_size = kwargs.get(
@@ -413,7 +721,14 @@ class MonteCarlo_attack(attack):
             if len(synthetic_data) == 0:
                 raise ValueError("synthetic_data must contain at least 1 sample")
 
+        if self.neighborhood == "knn" and self.k_neighbors > n_samples:
+            raise ValueError("k_neighbors cannot exceed n_samples")
+
         counts = np.zeros(len(candidates), dtype=float)
+        distance_sums = np.zeros(len(candidates), dtype=float)
+        nearest = None
+        if self.neighborhood == "knn":
+            nearest = np.full((len(candidates), self.k_neighbors), np.inf)
         generated_so_far = 0
 
         while generated_so_far < n_samples:
@@ -435,16 +750,51 @@ class MonteCarlo_attack(attack):
             generated_count = generated_batch.shape[0]
             for start in range(0, len(candidates), candidate_batch_size):
                 end = min(start + candidate_batch_size, len(candidates))
-                counts[start:end] += self._count_inside_d_min(
-                    candidates[start:end],
-                    generated_batch,
+                distances = self._pairwise_distances(
+                    candidates[start:end], generated_batch
                 )
+                if self.neighborhood == "epsilon":
+                    selected = distances < self.d_min
+                    counts[start:end] += np.sum(selected, axis=1)
+                    if self.score_function == "log_distance":
+                        distance_sums[start:end] += np.sum(
+                            np.where(
+                                selected,
+                                np.log(distances + self.log_delta),
+                                0.0,
+                            ),
+                            axis=1,
+                        )
+                    elif self.score_function == "average_distance":
+                        distance_sums[start:end] += np.sum(
+                            np.where(selected, distances, 0.0), axis=1
+                        )
+                else:
+                    combined = np.concatenate(
+                        [nearest[start:end], distances], axis=1
+                    )
+                    nearest[start:end] = np.partition(
+                        combined, self.k_neighbors - 1, axis=1
+                    )[:, :self.k_neighbors]
+                del distances
 
             del generated_batch
             generated_so_far += generated_count
             self._cleanup_after_batch()
 
-        return counts / generated_so_far
+        if self.neighborhood == "knn":
+            if self.score_function == "log_distance":
+                return -np.sum(np.log(nearest + self.log_delta), axis=1)
+            return -np.mean(nearest, axis=1)
+
+        if self.score_function == "count":
+            return counts / generated_so_far
+        if self.score_function == "log_distance":
+            return -distance_sums
+
+        means = np.full(len(candidates), np.inf)
+        np.divide(distance_sums, counts, out=means, where=counts > 0)
+        return -means
 
     def score(self, candidates, synthetic_data=None, modelWrapper=None, **kwargs):
         """
