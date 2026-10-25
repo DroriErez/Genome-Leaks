@@ -34,6 +34,9 @@ from models.VAE.models_10K_VAE import VAE
 
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper
 from utils.device import get_device
+from utils.genome_config import (
+    UNPADDED_SNP_COUNT, PADDED_GENOME_LENGTH, CONV_LATENT_DEPTH_FACTOR,
+)
 
 
 class VAE_generative(GenomeGenerativeModelWrapper):
@@ -63,6 +66,17 @@ class VAE_generative(GenomeGenerativeModelWrapper):
         if model_path:
             self.init(model_path)
 
+    def prepare_analysis_data(self, data):
+        """Remove trailing 1000 Genomes dataset padding when requested."""
+        if data is None or not getattr(self, "remove_padding", False):
+            return data
+        if data.ndim != 2 or data.shape[1] not in (UNPADDED_SNP_COUNT, PADDED_GENOME_LENGTH):
+            raise ValueError(
+                f"{self.model_name}: expected {UNPADDED_SNP_COUNT} biological SNPs "
+                f"or {PADDED_GENOME_LENGTH} padded features, got {data.shape}"
+            )
+        return data[:, :UNPADDED_SNP_COUNT]
+
     def init(self, file_path: str) -> None:
         """Load a VAE model checkpoint.
 
@@ -78,10 +92,10 @@ class VAE_generative(GenomeGenerativeModelWrapper):
             # require metadata to recreate same architecture, or pass manual hyperparameters when using this class
             data_shape = checkpoint.get('data_shape')
             if data_shape is None:
-                data_shape = 16383
+                data_shape = PADDED_GENOME_LENGTH
             latent_size = checkpoint.get('latent_size')
             if latent_size is None:
-                latent_size = int((data_shape+1)/(2**12))
+                latent_size = int((data_shape+1)/(2**CONV_LATENT_DEPTH_FACTOR))
             channels = checkpoint.get('channels')
             if channels is None:
                 channels = 8
