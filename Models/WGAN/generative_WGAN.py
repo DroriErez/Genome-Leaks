@@ -22,6 +22,9 @@ import numpy as np
 from models.Gen_Model_Wrapper import GenomeGenerativeModelWrapper
 from models.WGAN.models_10K import ConvDiscriminator, ConvGenerator
 from utils.device import get_device
+from utils.genome_config import (
+    UNPADDED_SNP_COUNT, PADDED_GENOME_LENGTH, CONV_LATENT_DEPTH_FACTOR,
+)
 
 
 class WGAN_generative(GenomeGenerativeModelWrapper):
@@ -50,6 +53,17 @@ class WGAN_generative(GenomeGenerativeModelWrapper):
         if model_path:
             self.init(model_path)
 
+    def prepare_analysis_data(self, data):
+        """Remove trailing 1000 Genomes dataset padding when requested."""
+        if data is None or not getattr(self, "remove_padding", False):
+            return data
+        if data.ndim != 2 or data.shape[1] not in (UNPADDED_SNP_COUNT, PADDED_GENOME_LENGTH):
+            raise ValueError(
+                f"{self.model_name}: expected {UNPADDED_SNP_COUNT} biological SNPs "
+                f"or {PADDED_GENOME_LENGTH} padded features, got {data.shape}"
+            )
+        return data[:, :UNPADDED_SNP_COUNT]
+
     def init(self, file_path: str) -> None:
         """Load a WGAN generator and critic checkpoint."""
         checkpoint = self._load_checkpoint(file_path)
@@ -61,8 +75,8 @@ class WGAN_generative(GenomeGenerativeModelWrapper):
             self.channels = 10 #channel multiplier which dictates the number of channels for all layers
             self.gpu = 1 #number of GPUs
             self.noise_dim = 2 #dimension of noise for each noise vector
-            latent_depth_factor = 12 #14 for 65535 SNP data and 12 for 16383 zero padded SNP data
-            self.data_shape = 16383 #set the data shape
+            latent_depth_factor = CONV_LATENT_DEPTH_FACTOR
+            self.data_shape = PADDED_GENOME_LENGTH
             self.latent_size = int((self.data_shape+1)/(2**latent_depth_factor)) #set the latent_size
             self.pack_m = 3 #number of samples to pack together for the critic
 
